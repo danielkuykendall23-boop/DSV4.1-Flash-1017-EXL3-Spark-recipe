@@ -62,6 +62,14 @@ The API is OpenAI-compatible at `http://<host>:8000/v1`, model id `dsv41`.
 `DRY_RUN=1 bash scripts/serve.sh` prints the full launch configuration without
 touching the box.
 
+If `$ALIAS_DIR` already holds a side file from an earlier version of this recipe,
+rebuild it (`build_cold_alias.sh` rewrites `experts.bin` and `manifest.json` in
+place, ~10 s): the shipped selection changed from 1,380 experts over 24 layers to
+1,418 over 43, and the two files are the same size, so a stale one is not
+detectable from the directory listing. `serve.sh` compares `$ALIAS_DIR/manifest.json`
+with `configs/cold-alias-selection.json` and refuses a side file built from another
+selection (`ALLOW_ALIAS_MISMATCH=1` overrides).
+
 The first boot after the steps above can run 1.5-3x slow for its whole life (an image
 build just before it leaves the cold working set out of the page cache). Once it is ready, run `bash scripts/guard.sh
 stop` and `bash scripts/serve.sh` again; the second boot runs at the measured speed (see
@@ -145,8 +153,19 @@ layers, re-selected from a route histogram that includes long and agentic prompt
 side-file size and resident footprint) was measured on another GB10 box at `MAXLEN=32768`:
 bench7 131.3 / 132.0 ms/step against 139.8 for the first set, an 18-request agentic replay
 407.6 / 400.4 s against 763.4 s, NVMe read during one bench7 9.7-10.8 GiB against
-13.5-18.2 (details in `docs/ENGINEERING_NOTES.md`). It has not yet been measured on the
-measurement box at the default 524288.
+13.5-18.2 (details in `docs/ENGINEERING_NOTES.md`).
+
+On the measurement box at the shipped default `MAXLEN=524288` the shipped set is faster than
+the first one: two boots each, alternating old/new with only `ALIAS_DIR` switched, bench7 mean
+**130.5 ms/step** (129.7 / 131.3; per class prose 126.0, code 134.5, structured 131.0)
+against **137.1** (138.4 / 135.7; 134.6 / 140.6 / 136.0), -4.8 %. NVMe read during one
+bench7 fell from 10.27 / 10.60 GiB to 7.04 / 7.28 GiB. Ready time and resident footprint are
+unchanged (193-198 s, 3.07-3.21 GiB MemAvailable at ready, 2.92-3.20 GiB page cache).
+
+| Cold set | ms/step, two boots | tok/step | tok/s | NVMe read, one bench7 |
+|---|---:|---:|---:|---:|
+| first (1,380 experts / 24 layers) | 138.4, 135.7 | 4.73 | 34.1, 34.9 | 10.27, 10.60 GiB |
+| **shipped (1,418 / 43)** | **129.7, 131.3** | 4.69 | 35.6, 36.3 | 7.04, 7.28 GiB |
 
 One row per configuration. `bench7.py`, single stream, 512 generated tokens with
 `ignore_eos`, three unique prompts per class (prose / code / structured).
@@ -229,6 +248,7 @@ Prefix caching is off, so every row is a full prefill.
 | 229,376 | 224,983 | 0.1 | 195.5 s | 1,151 | 31.5 | yes | 3.01 GiB |
 | **524,288 (default)** | 393,176 | 0.1 | 380.6 s | 1,033 | 29.3 | yes | 2.07 GiB |
 | **524,288 (default)** | 519,984 | 0.5 | 516.4 s | 1,007 | 29.3 | yes | 2.23 GiB |
+| **524,288 (default), shipped cold set** | 518,103 | 0.5 | 470.2 s | 1,102 | 25.6 | yes | 2.19 GiB |
 
 Short prompts (bench7, 512 tokens, k=5, warm boot), by `--max-model-len`:
 
@@ -359,6 +379,11 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   12 of 12 replays of the same states ended in 6-278 s with every closed invoke parsed,
   streaming included. It does not catch the rarer form where the model leaves out
   `</|DSML| parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
+  Checked on the measurement box with `DSML_STOP=1` (the default): one tool request at
+  `temperature=0` and five at `temperature=1.0` (`get_weather(city)`, `max_tokens` 2048-4096)
+  all ended right after the closed invoke — `finish_reason: tool_calls`, one parsed call with
+  `{"city": "Lisbon"}`, 49-56 `completion_tokens` — and a request without tools was unchanged
+  (`finish_reason: stop`, 21 tokens).
 
 ## Known limits
 

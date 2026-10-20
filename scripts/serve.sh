@@ -91,6 +91,26 @@ fi
 [ -d "$MODEL_DIR" ] || { echo "model dir not found: $MODEL_DIR" >&2; exit 1; }
 [ -f "$ALIAS_DIR/experts.bin" ] || { echo "alias side file not found: $ALIAS_DIR/experts.bin (run build_cold_alias.sh)" >&2; exit 1; }
 [ -f "$ALIAS_DIR/manifest.json" ] || { echo "alias manifest not found: $ALIAS_DIR/manifest.json" >&2; exit 1; }
+# The side file must hold the membership this recipe ships. A side file built by an
+# earlier version has the same size but a different expert set (1,380 over 24 layers
+# before, 1,418 over 43 now) and serves measurably slower.
+if ! python3 - "$ALIAS_DIR/manifest.json" "$RECIPE_HOME/configs/cold-alias-selection.json" <<'PY'
+import json, sys
+have = json.load(open(sys.argv[1])).get("experts") or {}
+want = json.load(open(sys.argv[2]))
+norm = lambda d: {k: sorted(int(e) for e in v) for k, v in d.items()}
+sys.exit(0 if norm(have) == norm(want) else 1)
+PY
+then
+  echo "alias side file $ALIAS_DIR was built from a different expert selection than" >&2
+  echo "configs/cold-alias-selection.json (an earlier recipe version?). Rebuild it:" >&2
+  echo "  bash scripts/build_cold_alias.sh        (~10-20 s, rewrites it in place)" >&2
+  if [ "${ALLOW_ALIAS_MISMATCH:-0}" != "1" ]; then
+    echo "(ALLOW_ALIAS_MISMATCH=1 serves it anyway)" >&2
+    exit 1
+  fi
+  echo "ALLOW_ALIAS_MISMATCH=1: serving it anyway" >&2
+fi
 sudo -n docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image not found: $IMAGE (run build_image.sh)" >&2; exit 1; }
 # The image must be the one build_image.sh makes from these pins. An older image under
 # the same tag (an earlier recipe version, or a hand-built one) serves different

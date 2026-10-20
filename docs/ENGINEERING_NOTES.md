@@ -47,11 +47,14 @@ Resident is 110.5 GiB of 121.7. Everything below was measured, not estimated.
 |---|---|
 | Everything resident | does not fit; un-aliasing layers 38/39 costs 4.6 GiB of transient load pressure and the guard kills the boot |
 | Whole-layer aliasing (layers 38/39 + all MTP experts) | ATS-slow: about 10 % of every aliased layer's experts are touched each step and the GPU reads them through ATS at ~6.6 GB/s; ~130 ms of a ~292 ms step |
-| Cold-expert alias side file (shipped) | 1,380 least-routed experts + embedding, 8.59 GiB, 64-byte aligned; **24.2 tok/s** from 13.5 |
+| Cold-expert alias side file (first set) | 1,380 least-routed experts + embedding, 8.59 GiB, 64-byte aligned; **24.2 tok/s** from 13.5 |
+| Cold set re-selected from a route histogram (shipped) | same 7.36 GiB of expert trellis, 1,418 experts over 43 layers (451 shared with the first set). MAXLEN=32768, KVB 256 MiB, prefix caching off, two fresh boots; first set in brackets. Agentic multi-turn replay, 18 held-out chat requests, 155K prompt tokens: time to first token 220.4 / 217.0 s (532.8), total 407.6 / 400.4 s (763.4), decode 137.2 / 136.1 ms/step (167.4). 10 held-out long source prompts: 197.5 / 194.3 s (331.1). bench7 131.3 / 132.0 ms/step (139.8); six short held-out prompts 132.6 / 130.4 (133.8). Needle 8/8. The weights are the same bytes, only their placement changes. A histogram from short prompts alone (1,355 experts) helped bench7 the same but long prompts much less (replay total 685.6 s) |
 | MTP experts resident (with 38/39 aliased) | **regression, 9.5 tok/s** (411-847 ms/step): the extra 2.8 GiB leaves 1.2 GiB available, the page cache collapses and the still-aliased layers read even slower |
 | `--max-num-batched-tokens 8192` | does not fit |
 
-The cold set is a routing-frequency selection, not a calibration. Experts the
+The cold set is a routing-frequency selection, not a calibration. The histogram behind the shipped set is `VLLM_EXL3_ROUTE_STATS=1` over bench7, six short code/prose completions,
+ten long source-code prompts (~6K tokens) and eighteen agentic multi-turn chat replays (tool calls and results, 4-10K tokens), selected with `tools/ats_build_alias.py --select-npz ... --budget-gib 7.3622 --rows 7`.
+With the first set the page cache churned: ~21 GiB read in and evicted in 263 s, with the hottest cold experts re-read up to ~27x. Experts the
 router rarely picks are the ones whose pages can come from NVMe without hurting
 the step; the membership is `configs/cold-alias-selection.json`.
 

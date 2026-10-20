@@ -15,7 +15,7 @@ The pack holds SAGE MixedK EXL3 routed experts (mixed K1-K4 per projection,
 for every other linear, and the Engram n-gram tables. The Engram tables are
 streamed from NVMe; everything else is meant to be device-resident. Under vLLM
 on one Spark that does not quite fit, so this recipe serves it with a
-**cold-expert alias side file**: the 1,380 least-routed experts plus the
+**cold-expert alias side file**: the 1,418 least-routed experts plus the
 embedding are gathered into one 64-byte-aligned file that the GPU reads through
 a read-only mapping, which leaves every hot expert resident with ~4 GiB to spare
 at `--max-model-len 32768` and 3.1-3.2 GiB at the shipped default of 524,288.
@@ -477,7 +477,7 @@ from-scratch install without them boots, passes `smoke.sh`, answers
 | `docker/tp1_decode_tiles.py` | TP1 decode tile tables for the base image's FP8 TileLang linears |
 | `scripts/build_cold_alias.sh` | builds the cold-expert side file from your own pack copy |
 | `tools/ats_build_alias.py` | the gatherer (64-byte alignment, manifest, selection) |
-| `configs/cold-alias-selection.json` | the measured 1,380-expert membership |
+| `configs/cold-alias-selection.json` | the measured 1,418-expert membership |
 | `scripts/serve.sh` | host wrapper: docker run, sysctls, memory guard |
 | `scripts/serve_inner.sh` | the exact measured in-container vLLM invocation |
 | `scripts/guard.sh` | memory guard, status, stop (restores sysctls) |

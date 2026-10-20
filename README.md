@@ -62,8 +62,8 @@ The API is OpenAI-compatible at `http://<host>:8000/v1`, model id `dsv41`.
 `DRY_RUN=1 bash scripts/serve.sh` prints the full launch configuration without
 touching the box.
 
-The first boot after the steps above can run 1.5-2.6x slow for its whole life (heavy
-writes just landed on the serving disk). Once it is ready, run `bash scripts/guard.sh
+The first boot after the steps above can run 1.5-3x slow for its whole life (an image
+build just before it leaves the cold working set out of the page cache). Once it is ready, run `bash scripts/guard.sh
 stop` and `bash scripts/serve.sh` again; the second boot runs at the measured speed (see
 "Keep the disk quiet").
 
@@ -259,25 +259,45 @@ on it drove MemAvailable to 0.44 GiB and the guard stopped it. 524,288 is the la
 limit that passed with margin.
 
 **Keep the disk quiet while serving, and restart once after building.** Cold experts
-are read from NVMe on every step. The first boot after heavy writes to the serving disk
-(an image build, the download, the alias build) can run slow for its whole life, and a
-second boot is normal. Measured on the measurement box (98 % full NVMe, same image and
-config, warm JIT cache):
+are read from NVMe on every step. The first boot after an image build runs slow for its
+whole life and the next boot is normal. Measured on the measurement box (98 % full NVMe,
+same image and config, warm JIT cache, 1 s disk/vmstat/clock sampling, `bench7`):
 
-| Boot | bench7 ms/step |
-|---|---:|
-| first boot right after `docker build --no-cache` of the image | 358.6 (179-649) |
-| same, plus `drop_caches` and `compact_memory` before the boot | 214.3 (161-303) |
-| the next boot, no writes in between | 137.3 (131-145) |
-| a first boot after a build, re-benched 10 minutes later on the same boot | 190 -> 228 |
-| that configuration restarted | 140.2 |
+| Boot | ms/step | NVMe read ms | NVMe MiB/s | compact_stall/s | pgscan_direct/s | page cache at ready |
+|---|---:|---:|---:|---:|---:|---:|
+| control, boot after a serve stop | 138.5 (126-147) | 0.63 | 58 | 3 | 0 | 2.97 GiB |
+| after 12 GiB of `O_DIRECT` writes, no build | 138.9 (132-149) | 0.77 | 56 | 4 | 81 | 3.41 |
+| after 119 GiB of pack reads, no writes | 135.3 (125-145) | 0.75 | 58 | 0 | 0 | 3.32 |
+| first boot after `docker build --no-cache` | 230.1 (170-403) | 0.25 | 174 | 252 | 3614 | 0.81 |
+| ... the same boot, re-benched at +10 / +20 min | 203.9 / 206.1 | | | | | |
+| ... after a build with `drop_caches=3` + `compact_memory` before the boot | 420.9 (179-726) | 0.24 | 261 | 1145 | 8692 | 0.40 |
+| ... and then stop + serve again | 141.3 (132-158) | 0.59 | 60 | 3 | 91 | 3.32 |
 
-So after `build_image.sh`, `download_and_verify.sh` or `build_cold_alias.sh`, start the
-server, stop it (`scripts/guard.sh stop`) and start it again before you measure or rely
-on it; waiting on a slow boot does not help. An older case on a 97 %-full disk ran
-509.5 ms/step and 253 tok/s prefill for 25 minutes. The mechanism (memory layout at
-load versus the drive after heavy writes) is still being isolated. Do not build images
-or copy large files on the serving disk while it serves.
+The drive is not the problem: it reads *faster* in the slow boots (0.25 ms, 174-261 MiB/s)
+than in the control (0.63 ms, 58 MiB/s), and 12 GiB of direct writes does not reproduce
+it. Boot-time free memory and fragmentation are not the problem either: the cleanest
+pre-boot state of the matrix (117.3 GiB free, 67 % of it in >= 2 MiB blocks, 0.1 GiB of
+cache) was the slowest boot. What changes is how much of the cold working set is resident
+in the page cache once the engine owns its ~107 GiB. `MemAvailable` is ~3.1 GiB in every
+arm; the split of that residual is what moves. With ~3 GiB of cold-expert pages resident a
+step reads ~8 MiB from NVMe; with ~0.5 GiB resident it re-reads 40-110 MiB per step, and
+the kernel runs direct reclaim and compaction on the faulting path (3.6k-8.7k pages/s
+scanned, 250-1150 compaction stalls/s, 4-7x the major faults) even though ~3 GiB is free,
+while the GPU sits at its normal 2496-2528 MHz. Why that free memory is not taken up by
+the cache after a build is not pinned down; the reclaim apparently keeps evicting the pages
+just read, because the state does not decay.
+
+The condition is set by the load and does not decay: 230.1, then 203.9 at +10 min and
+206.1 at +20 min on the same boot. So after `build_image.sh`, `download_and_verify.sh` or
+`build_cold_alias.sh`, start the server, stop it (`scripts/guard.sh stop`) and start it
+again before you measure or rely on it; waiting on a slow boot does not help, and
+`drop_caches`/`compact_memory` before the boot do not either. `serve.sh` writes the
+ready-state split to `$RUN/ready-mem`, and `scripts/guard.sh status` prints it and warns
+when the cache is under 1.5 GiB (normal boots 2.97-3.41 GiB, slow ones 0.40-0.81). Earlier,
+less instrumented runs agree: 358.6 ms/step after a build, 214.3 with `drop_caches` +
+`compact_memory`, 190 -> 228 on one slow boot re-benched after 10 minutes, and 137-140 after
+a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s prefill for
+25 minutes. Do not build images or copy large files on the serving disk while it serves.
 
 ## Quality and correctness
 

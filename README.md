@@ -139,6 +139,15 @@ MemAvailable floor, 64 MiB swap-growth allowance, 0.05 s sampling
 
 ## Measured speed
 
+**Cold-expert set.** Every speed figure on this page through the W2 row was measured with
+the first cold set (1,380 experts over 24 layers). The shipped set (1,418 experts over 43
+layers, re-selected from a route histogram that includes long and agentic prompts; same
+side-file size and resident footprint) was measured on another GB10 box at `MAXLEN=32768`:
+bench7 131.3 / 132.0 ms/step against 139.8 for the first set, an 18-request agentic replay
+407.6 / 400.4 s against 763.4 s, NVMe read during one bench7 9.7-10.8 GiB against
+13.5-18.2 (details in `docs/ENGINEERING_NOTES.md`). It has not yet been measured on the
+measurement box at the default 524288.
+
 One row per configuration. `bench7.py`, single stream, 512 generated tokens with
 `ignore_eos`, three unique prompts per class (prose / code / structured).
 `ms/step` and `tok/step` are read from the engine's own spec-decode counters;

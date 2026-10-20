@@ -252,6 +252,22 @@ experts.
 bench7 prompts do not share prefixes, so its step time is the no-hit cost. Not measured at
 long `MAXLEN` or with prompts past 7.5K tokens.
 
+**Smaller KV pool at 32K.** At `MAXLEN=32768` one request needs far less than the 1 GiB
+pool. `KVB=268435456` (256 MiB; vLLM reports 59,022 tokens, 1.80x one 32K request) gives
+~1 GiB back to the page cache that holds the cold-expert alias. Measured on two other
+boxes that have only ~1.0-1.1 GiB MemAvailable at ready in this config, bench7 as above,
+`MAXLEN=32768` on every row; mean step time -9 % on box A, -14 % on box B:
+
+| Box | `KVB` | Ready MemAvailable | ms/step mean | tok/s |
+|---|---:|---:|---:|---:|
+| A | 1 GiB | 1.07 GiB | 156.6, 163.1 | 28.1, 27.3 |
+| A | 256 MiB | 1.93-1.98 GiB | 149.4, 142.4 | 30.5, 31.7 |
+| B | 1 GiB | 1.1 GiB | 161.4, 160.2 | 27.4, 27.8 |
+| B | 256 MiB | 2.15 GiB | 141.0, 136.5 | 32.4, 31.7 |
+
+Not measured on the box above (~4 GiB free at 32K). Do not use 256 MiB with a long
+`MAXLEN`: the pool must hold at least one full-length request.
+
 **Why not 1M.** The prefill transient grows with prompt length (about 0.3 GiB at 225K,
 0.4 GiB at 393K, 0.9 GiB at 520K). A `--max-model-len 1048576` server boots (KV 1.25 GiB,
 ready MemAvailable 1.99 GiB, no RoPE-cache trim to give memory back), but a 524K prompt

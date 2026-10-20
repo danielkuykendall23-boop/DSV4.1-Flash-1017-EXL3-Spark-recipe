@@ -364,8 +364,16 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   `apply_chat_template` and encodes the conversation in code. Measured on a
   from-scratch install without either file: one user message ("What is the
   capital of France?", `max_tokens 32`) returns HTTP 200,
-  `finish_reason=stop`, `The capital of France is **Paris**.` If you point the
-  server at a different tokenizer mode, supply a template or chat will 400.
+  `finish_reason=stop`, `The capital of France is **Paris**.` Checked on a served
+  request (fresh download, this recipe's flags): the thinking comes back in
+  `message.reasoning` (`usage.completion_tokens_details.reasoning_tokens` counts it),
+  and a request with `tools` returns `finish_reason: tool_calls` with parsed
+  arguments (`--tool-call-parser deepseek_v41`). Reasoning effort goes in
+  `chat_template_kwargs`: `{"reasoning_effort": "low"}` renders `Reasoning Effort: 50`;
+  a top-level `reasoning_effort` field is ignored and the prompt keeps the default 75
+  (checked with `/tokenize` + `/detokenize`). All speed figures here are plain
+  `/v1/completions`. If you point the server at a different tokenizer mode, supply a
+  template or chat will 400.
 - **Image build: built and served from scratch on the measurement box.**
   `scripts/build_image.sh` on a fresh clone built the image in 269.6 s (+3.6 GB on
   the base); served through `scripts/serve.sh` with a freshly built alias and the

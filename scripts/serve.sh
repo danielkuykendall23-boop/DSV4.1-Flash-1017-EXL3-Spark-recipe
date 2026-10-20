@@ -17,13 +17,15 @@ TS=$(date +%Y%m%d-%H%M%S)
 RUN="${RUN_DIR:-$RUNS_DIR/$TS}"
 JIT="$CACHE_DIR/kkref/jit"
 
-mkdir -p "$RUN" "$JIT"/{b12x/compile,b12x/cute,cute-dsl,tilelang,triton,nv-compute,vllm-r5o}
+# The container gets $RUN/ctr only: guard.sh runs as root and reads/appends files in $RUN,
+# so the container must not be able to swap those for symlinks.
+mkdir -p "$RUN/ctr" "$JIT"/{b12x/compile,b12x/cute,cute-dsl,tilelang,triton,nv-compute,vllm-r5o}
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1: would launch container=$CONTAINER image=$IMAGE"
   echo "  model  : $MODEL_DIR -> /models/$MODEL_NAME"
   echo "  alias  : $ALIAS_DIR -> /alias"
-  echo "  run dir: $RUN -> /mem"
+  echo "  run dir: $RUN/ctr -> /mem"
   echo "  port   : $API_PORT"
   echo "  maxlen : $MAXLEN  kv=$KVB  mnbt=$MNBT  lpt=$LPT  mtp_k=$MTP_K"
   echo "  graphs : $CG_MODE sizes=$CAPTURE_SIZES  gpu_util=$GPU_MEM_UTIL"
@@ -87,7 +89,7 @@ sudo -n docker run -d --name "$CONTAINER" \
   -v "$MODELS_DIR":/models:ro \
   -v "$CACHE_DIR":/cache:rw \
   -v "$ALIAS_DIR":/alias:ro \
-  -v "$RUN":/mem:rw \
+  -v "$RUN/ctr":/mem:rw \
   -v "$HERE/serve_inner.sh":/root/serve.sh:ro \
   -p "$API_PORT":8000 \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \

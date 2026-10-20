@@ -320,6 +320,53 @@ def _install_rope_trim() -> None:
     DefaultModelLoader.load_model = load_model
 
 
+def _install_sampling_caps() -> None:
+    """Reject over-size sampling lists in the API server with a 400.
+
+    DSpark runs on Model Runner V2, whose sampler pre-sizes per-request buffers
+    (``v1/worker/gpu/sample/logit_bias.py``, ``bad_words.py``) and raises
+    ``ValueError`` inside EngineCore when a request exceeds them. EngineCore
+    treats that as fatal, so one request with 1,025 ``allowed_token_ids`` takes
+    the whole server down. The frontend only range-checks these lists
+    (upstream: vllm-project/vllm#55164). Check the same limits here, after
+    ``update_from_tokenizer`` has filled in the final stop and bad-word ids.
+    """
+    from vllm import envs
+    from vllm.exceptions import VLLMValidationError
+    from vllm.sampling_params import SamplingParams
+
+    orig = SamplingParams.update_from_tokenizer
+    if getattr(orig, "_dsv41_caps", False):
+        return
+    max_allowed, max_stop = 1024, 128  # MAX_NUM_ALLOWED_TOKEN_IDS, MAX_NUM_STOP_TOKEN_IDS
+
+    def update_from_tokenizer(self, tokenizer):
+        orig(self, tokenizer)
+        n = len(self.allowed_token_ids or ())
+        if n > max_allowed:
+            raise VLLMValidationError(
+                f"allowed_token_ids has {n} ids; the max is {max_allowed}",
+                parameter="allowed_token_ids",
+            )
+        n = len(self.all_stop_token_ids)
+        if self.min_tokens > 0 and n > max_stop:
+            raise VLLMValidationError(
+                f"min_tokens needs at most {max_stop} stop ids (incl. EOS); got {n}",
+                parameter="stop_token_ids",
+            )
+        n = sum(len(w) for w in self.bad_words_token_ids or ())
+        if n > envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS:
+            raise VLLMValidationError(
+                f"bad_words tokenize to {n} tokens; the max is "
+                f"{envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS}",
+                parameter="bad_words",
+            )
+
+    update_from_tokenizer._dsv41_caps = True
+    SamplingParams.update_from_tokenizer = update_from_tokenizer
+
+
+
 
 def _pack_head_trellis() -> tuple[str, int] | None:
     """Return (shard, K_bits) for the pack's EXL3 output head, or None."""
@@ -461,6 +508,7 @@ def register() -> None:
     _install_rope_trim()
     _install_exl3_head()
     _install_mem_probe()
+    _install_sampling_caps()
 
     if getattr(register, "_installed", False):
         return

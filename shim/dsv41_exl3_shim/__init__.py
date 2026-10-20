@@ -37,7 +37,8 @@ parameter+buffer bytes grouped by module path with the layer index collapsed to
 
 DSML tool-call stop (``DSV41_DSML_STOP=1``)
 -------------------------------------------
-Adds the stop string ``</｜DSML｜ invoke>\n</`` (kept in the output) to chat
+(In the DSML tags in these docstrings, ``|`` stands for U+FF5C, the fullwidth bar.)
+Adds the stop string ``</|DSML| invoke>\n</`` (kept in the output) to chat
 requests that carry tools, so a reply ends at the first closing tag after a
 closed invoke.  See ``_install_dsml_stop``.
 """
@@ -454,14 +455,14 @@ def _install_exl3_head() -> None:
 def _install_dsml_stop() -> None:
     """End a tool-call reply once a DSML invoke has closed and anything but DSML follows.
 
-    After ``</｜DSML｜ invoke>`` the only valid continuations are another
-    ``<｜DSML｜ invoke`` or ``</｜DSML｜ calls>``.  At temperature 1.0 the model
+    After ``</|DSML| invoke>`` the only valid continuations are another
+    ``<|DSML| invoke`` or ``</|DSML| calls>``.  At temperature 1.0 the model
     sometimes skips the calls terminator and writes an unbounded run of
     invented closing tags (``</arguments>``, ``</function>`` ...) until EOS or
     ``max_tokens``.  The tool parser keeps the valid invokes and drops the rest,
     so the reply looks normal but can cost tens of thousands of decode steps.
 
-    The stop string ``</｜DSML｜ invoke>\n</`` fires on both the valid
+    The stop string ``</|DSML| invoke>\n</`` fires on both the valid
     terminator and the junk, and is kept in the output, so every closed invoke
     still parses.  Only requests that carry tools are touched.
     """

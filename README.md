@@ -139,6 +139,15 @@ MemAvailable floor, 64 MiB swap-growth allowance, 0.05 s sampling
 
 ## Measured speed
 
+**Cold-expert set.** Every speed figure on this page through the W2 row was measured with
+the first cold set (1,380 experts over 24 layers). The shipped set (1,418 experts over 43
+layers, re-selected from a route histogram that includes long and agentic prompts; same
+side-file size and resident footprint) was measured on another GB10 box at `MAXLEN=32768`:
+bench7 131.3 / 132.0 ms/step against 139.8 for the first set, an 18-request agentic replay
+407.6 / 400.4 s against 763.4 s, NVMe read during one bench7 9.7-10.8 GiB against
+13.5-18.2 (details in `docs/ENGINEERING_NOTES.md`). It has not yet been measured on the
+measurement box at the default 524288.
+
 One row per configuration. `bench7.py`, single stream, 512 generated tokens with
 `ignore_eos`, three unique prompts per class (prose / code / structured).
 `ms/step` and `tok/step` are read from the engine's own spec-decode counters;
@@ -252,6 +261,22 @@ experts.
 bench7 prompts do not share prefixes, so its step time is the no-hit cost. Not measured at
 long `MAXLEN` or with prompts past 7.5K tokens.
 
+**Smaller KV pool at 32K.** At `MAXLEN=32768` one request needs far less than the 1 GiB
+pool. `KVB=268435456` (256 MiB; vLLM reports 59,022 tokens, 1.80x one 32K request) gives
+~1 GiB back to the page cache that holds the cold-expert alias. Measured on two other
+boxes that have only ~1.0-1.1 GiB MemAvailable at ready in this config, bench7 as above,
+`MAXLEN=32768` on every row; mean step time -9 % on box A, -14 % on box B:
+
+| Box | `KVB` | Ready MemAvailable | ms/step mean | tok/s |
+|---|---:|---:|---:|---:|
+| A | 1 GiB | 1.07 GiB | 156.6, 163.1 | 28.1, 27.3 |
+| A | 256 MiB | 1.93-1.98 GiB | 149.4, 142.4 | 30.5, 31.7 |
+| B | 1 GiB | 1.1 GiB | 161.4, 160.2 | 27.4, 27.8 |
+| B | 256 MiB | 2.15 GiB | 141.0, 136.5 | 32.4, 31.7 |
+
+Not measured on the box above (~4 GiB free at 32K). Do not use 256 MiB with a long
+`MAXLEN`: the pool must hold at least one full-length request.
+
 **Why not 1M.** The prefill transient grows with prompt length (about 0.3 GiB at 225K,
 0.4 GiB at 393K, 0.9 GiB at 520K). A `--max-model-len 1048576` server boots (KV 1.25 GiB,
 ready MemAvailable 1.99 GiB, no RoPE-cache trim to give memory back), but a 524K prompt
@@ -322,17 +347,18 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   tail. Do not build exact-match tests on it; compare logprobs.
 - Pack-level quality figures are on the model card. This recipe did not re-run
   them.
-- **Tool-call replies can run away without the DSML stop.** At `temperature=1.0` the
-  model sometimes closes an invoke and then, instead of `</｜DSML｜ calls>`, writes
+- **Tool-call replies can run away without the DSML stop.** (In the DSML tags below, `|` stands for
+  U+FF5C, the fullwidth bar the model actually emits.) At `temperature=1.0` the
+  model sometimes closes an invoke and then, instead of `</|DSML| calls>`, writes
   invented closing tags (`</arguments>`, then `</function>` thousands of times) until
   EOS or `max_tokens`. The tool parser keeps the valid invokes and drops the rest, so
   the reply looks normal; only `usage.completion_tokens` shows it. Replaying two agent
   conversation states (1.9K and 63.7K-token prompts), 2 of 6 replies failed this way,
   one at 32,313 tokens / 648 s for 6 valid calls. `DSML_STOP=1` (the default) adds the
-  stop string `</｜DSML｜ invoke>\n</`, kept in the output, to requests that carry tools:
+  stop string `</|DSML| invoke>\n</`, kept in the output, to requests that carry tools:
   12 of 12 replays of the same states ended in 6-278 s with every closed invoke parsed,
   streaming included. It does not catch the rarer form where the model leaves out
-  `</｜DSML｜ parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
+  `</|DSML| parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
 
 ## Known limits
 
@@ -348,8 +374,16 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   `apply_chat_template` and encodes the conversation in code. Measured on a
   from-scratch install without either file: one user message ("What is the
   capital of France?", `max_tokens 32`) returns HTTP 200,
-  `finish_reason=stop`, `The capital of France is **Paris**.` If you point the
-  server at a different tokenizer mode, supply a template or chat will 400.
+  `finish_reason=stop`, `The capital of France is **Paris**.` Checked on a served
+  request (fresh download, this recipe's flags): the thinking comes back in
+  `message.reasoning` (`usage.completion_tokens_details.reasoning_tokens` counts it),
+  and a request with `tools` returns `finish_reason: tool_calls` with parsed
+  arguments (`--tool-call-parser deepseek_v41`). Reasoning effort goes in
+  `chat_template_kwargs`: `{"reasoning_effort": "low"}` renders `Reasoning Effort: 50`;
+  a top-level `reasoning_effort` field is ignored and the prompt keeps the default 75
+  (checked with `/tokenize` + `/detokenize`). All speed figures here are plain
+  `/v1/completions`. If you point the server at a different tokenizer mode, supply a
+  template or chat will 400.
 - **Image build: built and served from scratch on the measurement box.**
   `scripts/build_image.sh` on a fresh clone built the image in 269.6 s (+3.6 GB on
   the base); served through `scripts/serve.sh` with a freshly built alias and the

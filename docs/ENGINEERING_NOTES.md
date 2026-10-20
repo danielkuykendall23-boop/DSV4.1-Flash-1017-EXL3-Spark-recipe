@@ -30,7 +30,14 @@ second order.
   plus `label=disable` and `memlock=-1` are requirements, not tuning.
 - **Aligned prefill chunks need `--long-prefill-token-threshold 2047`.**
 - **`max_position_embeddings` is 1M**, so the two shared RoPE caches are 256 MiB
-  each in fp32. Trimming them to `max_model_len` frees 0.484 GiB at boot.
+  each in fp32. Trimming them to `max_model_len` frees 0.484 GiB at boot
+  (`ROPE TRIM ... rows` in the log is the receipt; 0.250 GiB at 524,288).
+- **`VLLM_EXL3_TRIM_AFTER_LAYER=1` is inert at this pin.** The per-layer
+  `malloc_trim`/`empty_cache` hook lives in `patch_trim.py`, which patches
+  `vllm_exl3/exl3.py` *inside the image*; the measured server bind-mounted
+  `plugin-moe-p9b` over that directory, so the hook was shadowed and never ran.
+  `serve.sh` still passes the variable (it is harmless), but do not attribute any
+  memory number to it. Bake `patch_trim.py` or drop the variable.
 
 ## 2. Memory: what stays resident
 
@@ -40,11 +47,14 @@ Resident is 110.5 GiB of 121.7. Everything below was measured, not estimated.
 |---|---|
 | Everything resident | does not fit; un-aliasing layers 38/39 costs 4.6 GiB of transient load pressure and the guard kills the boot |
 | Whole-layer aliasing (layers 38/39 + all MTP experts) | ATS-slow: about 10 % of every aliased layer's experts are touched each step and the GPU reads them through ATS at ~6.6 GB/s; ~130 ms of a ~292 ms step |
-| Cold-expert alias side file (shipped) | 1,380 least-routed experts + embedding, 8.59 GiB, 64-byte aligned; **24.2 tok/s** from 13.5 |
+| Cold-expert alias side file (first set) | 1,380 least-routed experts + embedding, 8.59 GiB, 64-byte aligned; **24.2 tok/s** from 13.5 |
+| Cold set re-selected from a route histogram (shipped) | same 7.36 GiB of expert trellis, 1,418 experts over 43 layers (451 shared with the first set). MAXLEN=32768, KVB 256 MiB, prefix caching off, two fresh boots; first set in brackets. Agentic multi-turn replay, 18 held-out chat requests, 155K prompt tokens: time to first token 220.4 / 217.0 s (532.8), total 407.6 / 400.4 s (763.4), decode 137.2 / 136.1 ms/step (167.4). 10 held-out long source prompts: 197.5 / 194.3 s (331.1). bench7 131.3 / 132.0 ms/step (139.8); six short held-out prompts 132.6 / 130.4 (133.8). Needle 8/8. The weights are the same bytes, only their placement changes. A histogram from short prompts alone (1,355 experts) helped bench7 the same but long prompts much less (replay total 685.6 s) |
 | MTP experts resident (with 38/39 aliased) | **regression, 9.5 tok/s** (411-847 ms/step): the extra 2.8 GiB leaves 1.2 GiB available, the page cache collapses and the still-aliased layers read even slower |
 | `--max-num-batched-tokens 8192` | does not fit |
 
-The cold set is a routing-frequency selection, not a calibration. Experts the
+The cold set is a routing-frequency selection, not a calibration. The histogram behind the shipped set is `VLLM_EXL3_ROUTE_STATS=1` over bench7, six short code/prose completions,
+ten long source-code prompts (~6K tokens) and eighteen agentic multi-turn chat replays (tool calls and results, 4-10K tokens), selected with `tools/ats_build_alias.py --select-npz ... --budget-gib 7.3622 --rows 7`.
+With the first set the page cache churned: ~21 GiB read in and evicted in 263 s, with the hottest cold experts re-read up to ~27x. Experts the
 router rarely picks are the ones whose pages can come from NVMe without hurting
 the step; the membership is `configs/cold-alias-selection.json`.
 
@@ -54,8 +64,9 @@ the step; the membership is `configs/cold-alias-selection.json`.
   step -29 %. One launch per layer covers every K group instead of one dispatch
   per K group, which also removes most of the routing glue launches.
 - **Tile-K 16 (`MOE_TILESIZE_K`) is the single biggest kernel win: 190 → 142
-  ms/step, -25 %.** It is a compile-time constant, which is why the image build
-  rewrites the header.
+  ms/step, -25 %.** It is a compile-time `#define`. At the pinned fork commit the
+  header already reads 16; the image build rewrites it to `MOE_TILESIZE_K` anyway and
+  fails if the result is not that value, so the build argument cannot be ignored.
 - **`__launch_bounds__(256, 2)` cannot give 2 CTAs/SM on this part.** GB10
   exposes 100 KiB of shared memory per SM, and the launcher always requests
   90 KiB as dynamic smem, whatever instance it picked. Two CTAs need 186 KiB.
@@ -69,8 +80,24 @@ the step; the membership is `configs/cold-alias-selection.json`.
   not short of warps.
 - **Removing one of the four `bar.sync` per K-slice: -3.9 % cold, about -3.8
   ms/step in model** (2.646 -> 2.543 ms/layer; 145.4/141.3 -> 140.0/139.1 ms/step
-  over two alternating pairs), bit-exact. Not shipped yet: its teacher-forced
-  gate was one better and one worse than the baseline's across the two pairs.
+  over two alternating pairs), bit-exact. The slot read at iteration k is the slot
+  written at iteration k-3, so one barrier covers both hazards. Shipped as part of W2.
+- **W2, warp-private pipeline stages: -7.1 % cold vs that, -5.4 % in model, bit-exact
+  (shipped).** Each warp copies the A tile and the B fragments it later reads into its
+  own slot of the stage ring, so `cp.async.wait_group` + `__syncwarp()` order every
+  shared-memory read and the CTA-wide pipeline barriers leave the slice loop (6
+  barriers per loop body instead of 9). 47,104 B of shared memory per CTA instead of
+  29,184, still one CTA per SM; one size formula feeds the launcher, the accessors and
+  the kernel's static_assert. L2-cold at 7 rows 2.554 -> 2.372 ms/layer; in model at
+  524288 136.35 vs 144.2 ms/step over two alternating pairs (measurement launcher) and
+  133.0-141.0 vs 145.9 through the recipe. Outputs bit-identical in all 12 probe cells,
+  parity rel-L2 5.8e-08. The first version measured -7.7 % cold and was wrong (rel-L2
+  1.2-1.3): the code advancing each warp's A pointer between stages dropped the per-warp
+  offset that the setup code applied, so every warp read warp 0's tile with no barrier
+  left to make sharing safe. A CPU emulation of every shared-memory write and read across
+  the seven dispatched instances found it, and proves the fixed version reads exactly the
+  bytes the old kernel reads, each written by the reading warp's own lanes. A speedup
+  measured on wrong output is not a speedup; take parity before timing.
 - **The kernel already keeps enough bytes in flight.** About 188 KiB is in flight
   across the chip, against ~186 KiB needed to saturate DRAM at ~700 ns latency
   (Little's law). The same model predicts the measured speed at 3 smem stages,
@@ -127,25 +154,29 @@ the step; the membership is `configs/cold-alias-selection.json`.
 
 ## 5. Where it stands
 
-About 140-147 ms/step (140.5-142.0 at `--max-model-len 32768`, 147.2 at the
-default 524288), 4.1-4.8 accepted tokens/step, 27-35 tok/s. Per-step attribution
+With W2: 133-141 ms/step at the default 524288 (mean 137.4 over four boots),
+4.6-4.9 accepted tokens/step, 32-38 tok/s. Before it: 140.5-142.0 at
+`--max-model-len 32768`, 145.9-147.2 at 524288. The attribution below predates W2. Per-step attribution
 by CUDA graph (139.4 ms): 40 main layers verifying 6 rows 124.4 ms (89 %), verify
 head and sampling 2.9 ms, drafter 9.2 ms, glue 0.5 ms. Inside the main layers the
 MoE is the dominant cost; the shared expert runs on a second stream and is
 mostly hidden, so earlier anatomies that added it to the critical path
 over-counted it.
 
-Reaching 50 tok/s needs about 95 ms/step at ~4.7 tokens/step, i.e. about 45 ms
+Reaching 50 tok/s needs about 95 ms/step at ~4.7 tokens/step, i.e. about 42 ms
 out of the step. What is left, by evidence:
 
-1. **The MoE kernel's per-slice dependent chain.** Not bandwidth in flight, not
-   warps, not decode instructions (all measured above). The open variants
-   shorten the chain: fewer CTA-wide barriers through a column-private
-   reduction and per-warp ownership of the weight stages, and a run-ahead L2
-   prefetch of the next slices.
-2. **The drafter** (up to -2.5 ms): a draft head restricted to part of the
-   vocabulary. Emitted text is unchanged under greedy verify; acceptance may
-   move.
+1. **The MoE kernel's per-slice dependent chain, now mostly spent.** Not bandwidth
+   in flight, not warps, not decode instructions (all measured above). W2 removed
+   the CTA-wide pipeline barriers; the other chain-shortening variants (an extra
+   stage, more loads in flight, an earlier prefetch, each alone and combined) were
+   bit-exact and within +/-2 % cold, so they are not shipped. What remains is
+   exposed latency on the weight reads, about 116 GB/s achieved against ~270.
+2. **The drafter** (9.2 ms of the step). Measured: three MTP layers cut to two is
+   no faster (136.9/138.1 vs 136.35 ms/step) and accepts fewer tokens (4.51 vs 4.63
+   per step); `VLLM_EXL3_RECONSTRUCT_MIN_ROWS=3` (dense reconstruction at 3+ rows)
+   is 27 % slower. Open: a draft head restricted to part of the vocabulary (modelled
+   -2.5 ms; emitted text unchanged under greedy verify, acceptance may move).
 3. **The non-MoE FP8 linears are near the memory roof** (wo_b moves 42 MB in
    0.207 ms, ~200 GB/s, after the TP1 tiles). Only fewer bytes would move them.
 

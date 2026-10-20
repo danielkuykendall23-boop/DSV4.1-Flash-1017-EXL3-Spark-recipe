@@ -6,9 +6,12 @@
 
 # ---- model ----------------------------------------------------------------
 MODEL_REPO="vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw"
-# Revision the recipe was measured on. The Hub's main is pinned here so a
-# download is reproducible; see README "Pack revision" for the check.
-MODEL_REV="04f7138b8ce3c82399eb4900d8bad12e40a0a0da"
+# Hub revision to download. The repo's history has been replaced more than once
+# (each time a single "Initial commit" with the same files), so a commit id can
+# stop resolving. scripts/SHA256SUMS is the authority: download_and_verify.sh
+# falls back to main when this revision is gone, and the sha256 check decides.
+# See README "Pack revision".
+MODEL_REV="${MODEL_REV:-2a6059359c685cd0ea66e1e6c34e6803322ff095}"
 MODEL_NAME="dsv41-1.62bpw-v3"          # directory name under $MODELS_DIR
 
 # ---- images ---------------------------------------------------------------
@@ -21,8 +24,8 @@ IMAGE="${IMAGE:-dsv41-1017-exl3:r6w}"
 # Runtime forks baked into the layer above the base, pinned to the commits whose
 # file hashes match the measured server (branches named below).
 FORK_REPO="https://github.com/vcruz305/exllamav3.git"
-FORK_BRANCH="feat/dsv41-1017-tp1-moe"
-FORK_REF="${FORK_REF:-42981e660d18bd893fb1bf732905fafa2a9fe97c}"          # exllamav3: mixed-K unified MoE + aarch64 guards
+FORK_BRANCH="feat/moe-warp-private-stages"
+FORK_REF="${FORK_REF:-909ad8564fcb9e070caca8a65d380c741681e79c}"          # exllamav3: mixed-K unified MoE + aarch64 guards + warp-private MoE pipeline stages
 PLUGIN_REPO="https://github.com/vcruz305/vllm-exl3.git"
 PLUGIN_BRANCH="feat/dsv41-1017-tp1"
 PLUGIN_REF="${PLUGIN_REF:-30e8b941376ce2d43bc8438439937c4809106635}"    # vllm-exl3: Exl3MoEMethod / ATS loader
@@ -42,7 +45,7 @@ RUNS_DIR="${RUNS_DIR:-$RECIPE_HOME/runs}"
 # ---- serve ----------------------------------------------------------------
 CONTAINER="${CONTAINER:-dsv41-tp1}"
 API_PORT="${API_PORT:-8000}"
-MAXLEN="${MAXLEN:-524288}"      # largest measured clean limit (520K retrieval); 32768 is ~5 % faster on short prompts
+MAXLEN="${MAXLEN:-524288}"      # largest measured clean limit (520K retrieval); 32768 is 1-5 % faster on short prompts
 KVB="${KVB:-1073741824}"        # 1 GiB KV pool (vLLM reports 959,768 tokens at MAXLEN=524288)
 MNBT="${MNBT:-2112}"
 LPT="${LPT:-2047}"
@@ -50,6 +53,8 @@ MTP_K="${MTP_K:-5}"
 CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+PREFIX_CACHING="${PREFIX_CACHING:-0}"   # 1 = reuse KV of repeated prefixes (opt-in; off is the measured path)
+DSML_STOP="${DSML_STOP:-1}"             # 1 = end tool-call replies at the first closing tag after a DSML invoke
 ATS_LAYERS="${ATS_LAYERS:-38,39}"
 ATS_MTP="${ATS_MTP:-1}"
 ATS_EMBED="${ATS_EMBED:-1}"
@@ -57,5 +62,5 @@ ATS_EMBED="${ATS_EMBED:-1}"
 export MODEL_REPO MODEL_REV MODEL_NAME BASE_IMAGE IMAGE
 export FORK_REPO FORK_BRANCH FORK_REF PLUGIN_REPO PLUGIN_BRANCH PLUGIN_REF MOE_TILESIZE_K
 export RECIPE_HOME MODELS_DIR MODEL_DIR CACHE_DIR ALIAS_DIR RUNS_DIR
-export CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL
+export CONTAINER API_PORT MAXLEN KVB MNBT LPT MTP_K CAPTURE_SIZES CG_MODE GPU_MEM_UTIL PREFIX_CACHING DSML_STOP
 export ATS_LAYERS ATS_MTP ATS_EMBED

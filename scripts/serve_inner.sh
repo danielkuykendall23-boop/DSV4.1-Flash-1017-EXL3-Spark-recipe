@@ -19,8 +19,12 @@ MTP_K="${MTP_K:-5}"
 CAPTURE_SIZES="${CAPTURE_SIZES:-1,2,3,4,5,6,7}"
 CG_MODE="${CG_MODE:-FULL_DECODE_ONLY}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+# PREFIX_CACHING=1 reuses the KV of a repeated prompt prefix (multi-turn chat, agents).
+# Off is the measured single-stream path; see README "Prefix caching (opt-in)".
+PCF=--no-enable-prefix-caching
+[ "${PREFIX_CACHING:-0}" = "1" ] && PCF=--enable-prefix-caching
 
-echo "dsv41 serve: model=$MODEL_DIR maxlen=$MAXLEN kv=$KVB mnbt=$MNBT lpt=$LPT mtp_k=$MTP_K graphs=$CG_MODE"
+echo "dsv41 serve: model=$MODEL_DIR maxlen=$MAXLEN kv=$KVB mnbt=$MNBT lpt=$LPT mtp_k=$MTP_K graphs=$CG_MODE prefix_caching=${PREFIX_CACHING:-0}"
 
 exec vllm serve "$MODEL_DIR" \
     --served-model-name dsv41 \
@@ -31,7 +35,7 @@ exec vllm serve "$MODEL_DIR" \
     --distributed-executor-backend uni \
     --quantization exl3_dsv41 \
     --block-size 256 \
-    --no-enable-prefix-caching \
+    $PCF \
     --enable-chunked-prefill \
     --max-model-len "$MAXLEN" \
     --max-num-seqs 1 \

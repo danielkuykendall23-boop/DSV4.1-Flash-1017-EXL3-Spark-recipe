@@ -7,8 +7,8 @@ measured flag set, the cold-expert alias and the memory guard are not optional.
 Do NOT:
 - drop the cold-expert alias (`VLLM_EXL3_ATS_ALIAS=0`) and expect a boot: the
   pack does not fit resident on 121.7 GiB
-- build the exllamav3 fork without `MOE_TILESIZE_K=16`: you get the 25 %-slower
-  kernel and none of the README numbers apply
+- build the exllamav3 fork without `MOE_TILESIZE_K=16`: you get the 32-row tile,
+  ~34 % slower per step (190.6 vs 142.0 ms), and none of the README numbers apply
 - raise `--max-num-batched-tokens` to 8192 without re-measuring: it OOMs
 - enable prefix caching or `B12X_AUTOTUNE` as a "helpful" default (both measured
   off; autotune is hours of bring-up)

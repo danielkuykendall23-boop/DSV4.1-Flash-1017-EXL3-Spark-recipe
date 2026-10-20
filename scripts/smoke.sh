@@ -6,13 +6,17 @@ set -euo pipefail
 API_PORT="${API_PORT:-8000}"
 BASE="http://127.0.0.1:${API_PORT}/v1"
 
-RESP=$(curl -s -m 300 "$BASE/completions" -H 'Content-Type: application/json' -d '{
+# `set -e` plus a failing command substitution exits silently; say what failed.
+if ! RESP=$(curl -s -m 300 "$BASE/completions" -H 'Content-Type: application/json' -d '{
   "model": "dsv41",
   "prompt": "The capital of France is",
   "max_tokens": 16,
   "temperature": 0,
   "stream": false
-}')
+}'); then
+  echo "SMOKE FAIL: no response from $BASE/completions (curl rc=$?)" >&2
+  exit 1
+fi
 
 python3 - "$RESP" <<'PY'
 import json

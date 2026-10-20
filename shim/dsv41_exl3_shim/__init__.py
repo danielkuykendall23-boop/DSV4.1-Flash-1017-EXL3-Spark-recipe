@@ -34,6 +34,13 @@ one-line-per-stage memory waterfall (host MemAvailable / AnonPages / Cached /
 VmRSS, torch cuda allocated+reserved) plus, after the load returns, the
 parameter+buffer bytes grouped by module path with the layer index collapsed to
 ``*`` and the largest single tensors.  It only reads state; it never allocates.
+
+DSML tool-call stop (``DSV41_DSML_STOP=1``)
+-------------------------------------------
+(In the DSML tags in these docstrings, ``|`` stands for U+FF5C, the fullwidth bar.)
+Adds the stop string ``</|DSML| invoke>\n</`` (kept in the output) to chat
+requests that carry tools, so a reply ends at the first closing tag after a
+closed invoke.  See ``_install_dsml_stop``.
 """
 
 from __future__ import annotations
@@ -328,8 +335,11 @@ def _install_sampling_caps() -> None:
     ``ValueError`` inside EngineCore when a request exceeds them. EngineCore
     treats that as fatal, so one request with 1,025 ``allowed_token_ids`` takes
     the whole server down. The frontend only range-checks these lists
-    (upstream: vllm-project/vllm#55164). Check the same limits here, after
-    ``update_from_tokenizer`` has filled in the final stop and bad-word ids.
+    (upstream: vllm-project/vllm#55164). Check every limit the sampler enforces
+    here, after ``update_from_tokenizer`` has filled in the final stop and
+    bad-word ids: allowed token ids, logit-bias entries, stop ids under
+    ``min_tokens``, number of bad words and their total tokens. The limits are
+    read from the sampler module so they cannot drift from what it enforces.
     """
     from vllm import envs
     from vllm.exceptions import VLLMValidationError
@@ -338,34 +348,40 @@ def _install_sampling_caps() -> None:
     orig = SamplingParams.update_from_tokenizer
     if getattr(orig, "_dsv41_caps", False):
         return
-    max_allowed, max_stop = 1024, 128  # MAX_NUM_ALLOWED_TOKEN_IDS, MAX_NUM_STOP_TOKEN_IDS
+    try:
+        from vllm.v1.worker.gpu.sample import logit_bias as _lb
+
+        max_allowed = int(_lb.MAX_NUM_ALLOWED_TOKEN_IDS)
+        max_bias = int(_lb.MAX_NUM_LOGIT_BIAS_TOKENS)
+        max_stop = int(_lb.MAX_NUM_STOP_TOKEN_IDS)
+    except Exception:  # sampler module moved: fall back to the values it had
+        max_allowed, max_bias, max_stop = 1024, 1024, 128
+
+    def _reject(msg, parameter):
+        raise VLLMValidationError(msg, parameter=parameter)
 
     def update_from_tokenizer(self, tokenizer):
         orig(self, tokenizer)
         n = len(self.allowed_token_ids or ())
         if n > max_allowed:
-            raise VLLMValidationError(
-                f"allowed_token_ids has {n} ids; the max is {max_allowed}",
-                parameter="allowed_token_ids",
-            )
-        n = len(self.all_stop_token_ids)
-        if self.min_tokens > 0 and n > max_stop:
-            raise VLLMValidationError(
-                f"min_tokens needs at most {max_stop} stop ids (incl. EOS); got {n}",
-                parameter="stop_token_ids",
-            )
-        n = sum(len(w) for w in self.bad_words_token_ids or ())
-        if n > envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS:
-            raise VLLMValidationError(
-                f"bad_words tokenize to {n} tokens; the max is "
-                f"{envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS}",
-                parameter="bad_words",
-            )
+            _reject(f"allowed_token_ids has {n} ids; the max is {max_allowed}", "allowed_token_ids")
+        n = len(self.logit_bias or ())
+        if n > max_bias:
+            _reject(f"logit_bias has {n} entries; the max is {max_bias}", "logit_bias")
+        n = len(self.all_stop_token_ids or ())
+        if (self.min_tokens or 0) > 0 and n > max_stop:
+            _reject(f"min_tokens needs at most {max_stop} stop ids (incl. EOS); got {n}", "stop_token_ids")
+        words = self.bad_words_token_ids or ()
+        max_words = int(getattr(envs, "VLLM_MAX_NUM_BAD_WORDS", 128))
+        if len(words) > max_words:
+            _reject(f"bad_words has {len(words)} entries; the max is {max_words}", "bad_words")
+        n = sum(len(w) for w in words)
+        max_tok = int(envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS)
+        if n > max_tok:
+            _reject(f"bad_words tokenize to {n} tokens; the max is {max_tok}", "bad_words")
 
     update_from_tokenizer._dsv41_caps = True
     SamplingParams.update_from_tokenizer = update_from_tokenizer
-
-
 
 
 def _pack_head_trellis() -> tuple[str, int] | None:
@@ -492,6 +508,46 @@ def _install_exl3_head() -> None:
         cls.__init__ = _wrap(cls.__init__, head_prefix)
 
 
+def _install_dsml_stop() -> None:
+    """End a tool-call reply once a DSML invoke has closed and anything but DSML follows.
+
+    After ``</|DSML| invoke>`` the only valid continuations are another
+    ``<|DSML| invoke`` or ``</|DSML| calls>``.  At temperature 1.0 the model
+    sometimes skips the calls terminator and writes an unbounded run of
+    invented closing tags (``</arguments>``, ``</function>`` ...) until EOS or
+    ``max_tokens``.  The tool parser keeps the valid invokes and drops the rest,
+    so the reply looks normal but can cost tens of thousands of decode steps.
+
+    The stop string ``</|DSML| invoke>\n</`` fires on both the valid
+    terminator and the junk, and is kept in the output, so every closed invoke
+    still parses.  Only requests that carry tools are touched.
+    """
+    if os.environ.get("DSV41_DSML_STOP", "0") in ("0", "", "false"):
+        return
+    try:
+        from vllm.parser.deepseek_v41 import DeepSeekV41Parser
+    except Exception as exc:  # pragma: no cover
+        print(f"DSML stop install failed: {exc!r}", flush=True)
+        return
+    if getattr(DeepSeekV41Parser.adjust_request, "_dsv41_dsml_stop", False):
+        return
+    orig = DeepSeekV41Parser.adjust_request
+    stop_str = "</\uff5cDSML\uff5c invoke>\n</"
+
+    def adjust_request(self, request):
+        request = orig(self, request)
+        if getattr(request, "tools", None) and getattr(request, "tool_choice", None) != "none":
+            stop = request.stop
+            stop = [] if stop is None else ([stop] if isinstance(stop, str) else list(stop))
+            if stop_str not in stop:
+                request.stop = stop + [stop_str]
+                request.include_stop_str_in_output = True
+        return request
+
+    adjust_request._dsv41_dsml_stop = True
+    DeepSeekV41Parser.adjust_request = adjust_request
+
+
 def register() -> None:
     """Install the DSV4.1 EXL3 config. Idempotent."""
     import vllm_exl3
@@ -508,6 +564,7 @@ def register() -> None:
     _install_rope_trim()
     _install_exl3_head()
     _install_mem_probe()
+    _install_dsml_stop()
     _install_sampling_caps()
 
     if getattr(register, "_installed", False):

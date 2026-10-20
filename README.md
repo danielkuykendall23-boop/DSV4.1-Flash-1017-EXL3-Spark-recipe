@@ -15,17 +15,38 @@ The pack holds SAGE MixedK EXL3 routed experts (mixed K1-K4 per projection,
 for every other linear, and the Engram n-gram tables. The Engram tables are
 streamed from NVMe; everything else is meant to be device-resident. Under vLLM
 on one Spark that does not quite fit, so this recipe serves it with a
-**cold-expert alias side file**: the 1,380 least-routed experts plus the
+**cold-expert alias side file**: the 1,418 least-routed experts plus the
 embedding are gathered into one 64-byte-aligned file that the GPU reads through
-a read-only mapping, which leaves every hot expert resident with ~4 GiB to spare.
+a read-only mapping, which leaves every hot expert resident with ~4 GiB to spare
+at `--max-model-len 32768` and 3.1-3.2 GiB at the shipped default of 524,288.
 
 ## Status
 
 | Deployment | Folder | Model | Engine | Status |
 |---|---|---|---|---|
-| 1x Spark, TP1 | `scripts/` | vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw | spark-ds41f r6w + vllm-exl3 + exllamav3 (tile-K 16) + shim, DSpark k=5 | **Measured, serving** |
+| 1x Spark, TP1 | `scripts/` | vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw | spark-ds41f r6w + vllm-exl3 + exllamav3 (tile-K 16, warp-private MoE stages) + shim, DSpark k=5 | **Measured, serving** |
 
 ## Quick start (one Spark)
+
+Disk, measured on the measurement box: the pack is **326.6 GB** (304 GiB; two
+shards are ~101.5 GB each), the alias side file **8.6 GiB**, the base engine image
+**34.9 GB**, and the derived image adds **~2 GB** on top of it (36.9 GB as listed by
+`docker images`, shared layers). The first boot adds a few GB of JIT cache under
+`~/.cache/dsv41-ds41f/kkref/jit`. Budget **~400 GB free** on the NVMe the serve will
+read cold experts from, and keep it well short of full (see "Keep the disk quiet").
+`download_and_verify.sh` and `build_cold_alias.sh` check free space before writing.
+
+Host prerequisites: passwordless `sudo -n docker`, the base engine image (see
+`scripts/build_image.sh`), and `huggingface_hub` with `hf_xet` for the host-side
+download. On a stock Ubuntu 24.04 the documented install needs
+`--break-system-packages` (PEP 668 marks the system python externally managed):
+
+```bash
+python3 -m pip install --user --break-system-packages -U 'huggingface_hub[hf_xet]'
+```
+
+(`numpy` is only needed for the optional `--select-npz` route-histogram path in
+`tools/ats_build_alias.py`; the shipped `--experts-json` path is stdlib-only.)
 
 ```bash
 export HF_TOKEN=hf_...               # account must have accepted the model terms
@@ -41,6 +62,26 @@ The API is OpenAI-compatible at `http://<host>:8000/v1`, model id `dsv41`.
 `DRY_RUN=1 bash scripts/serve.sh` prints the full launch configuration without
 touching the box.
 
+If `$ALIAS_DIR` already holds a side file from an earlier version of this recipe,
+rebuild it (`build_cold_alias.sh` rewrites `experts.bin` and `manifest.json` in
+place, ~10 s): the shipped selection changed from 1,380 experts over 24 layers to
+1,418 over 43, and the two files are the same size, so a stale one is not
+detectable from the directory listing. `serve.sh` compares `$ALIAS_DIR/manifest.json`
+with `configs/cold-alias-selection.json` and refuses a side file built from another
+selection (`ALLOW_ALIAS_MISMATCH=1` overrides).
+
+The first boot after the steps above can run 1.5-3x slow for its whole life (an image
+build just before it leaves the cold working set out of the page cache). Once it is ready, run `bash scripts/guard.sh
+stop` and `bash scripts/serve.sh` again; the second boot runs at the measured speed (see
+"Keep the disk quiet").
+
+`build_image.sh` and `serve.sh` share one image tag (`IMAGE`, default
+`dsv41-1017-exl3:r6w`). If you build under another tag, pass the same `IMAGE=` to
+`serve.sh`. `serve.sh` refuses an image whose build labels do not match this
+recipe's pins (vllm-exl3, exllamav3, MoE tile K): an older image under the default
+tag serves older shim code and fails at weight load with `no module or parameter
+named 'head'`. Rebuild it with `build_image.sh`.
+
 ## The measured flag set (do not deviate without re-measuring)
 
 The engine is a derived image: `dsv41-1017-ds41f:r6w` (Christopher Owen's
@@ -50,7 +91,7 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 
 | Flag | Why it is there |
 |---|---|
-| `MOE_TILESIZE_K=16` (compile-time) | the served MoE kernel instance; 32 (upstream) is 25 % slower per step |
+| `MOE_TILESIZE_K=16` (compile-time) | the served MoE kernel instance: 190.6 -> 142.0 ms/step, i.e. the 32-row tile is ~34 % slower (the `sed` in `docker/Dockerfile` only matters for older `FORK_REF`s; at the pinned `909ad85` the header already reads 16 and the build asserts the value) |
 | `--quantization exl3_dsv41` + `--hf-overrides {...}` | EXL3 routed experts with the engine's native block-32 FP8 for every non-routed weight; the override restates it because the DSpark drafter re-derives the config |
 | `--speculative-config dspark k=5` | k=5 is the step/token knee at this step time; k=7 costs +17 ms for +0.55 tok/step |
 | `VLLM_EXL3_MIXEDK_MODE=unified` | one kernel for all K groups instead of one dispatch per group (+9 % mean) |
@@ -62,7 +103,7 @@ linears (`docker/tp1_decode_tiles.py`). Nothing else in the base image is replac
 | `--max-model-len 524288` | 512K tokens, the largest limit measured clean on one Spark: needle retrieval at 520K, minimum MemAvailable 2.23 GiB under that prefill, short-prompt decode 147.2 ms/step against 140.5-142.0 at 32K (see Measured long context). The model is rated for 1,048,576 (YaRN x16 over 65,536); 1M does not fit (the prefill transient grows with prompt length) |
 | `--max-num-batched-tokens 2112 --long-prefill-token-threshold 2047` | the aligned-prefill chunk; 8192 does not fit |
 | `--kv-cache-memory-bytes 1073741824` | 1 GiB KV at the engine's `auto` (bf16) cache dtype. The token count vLLM reports depends on `--max-model-len` for this hybrid attention (sliding-window and compressed groups): 236,089 at 32K, 394,892 at 64K, 595,001 at 128K, 760,070 at 229K, 959,768 at 524K (1.83x one full-length request) |
-| `--no-enable-prefix-caching` | measured off |
+| `--no-enable-prefix-caching` | measured off for single-stream decode; `PREFIX_CACHING=1` turns it on for repeated prefixes (see Prefix caching (opt-in)) |
 | `B12X_AUTOTUNE=0` | the base image's optional per-kernel autotune sweep is hours; prebuilt artifacts are the measured path |
 | `--security-opt seccomp=unconfined --security-opt label=disable --ulimit memlock=-1` | the Engram reader initialises io_uring; a default seccomp profile aborts it |
 | `--shm-size=2g` | measured value; the engine's shared-memory use is small at `--max-num-seqs 1` |
@@ -80,6 +121,8 @@ Host side, while serving: `vm.compaction_proactiveness=0`,
 | Graph capture | ~1 s |
 | **API ready (container start to `/v1/models` 200)** | **3 min 11 s** |
 
+The three stages above are not the whole 3 min 11 s: ~58 s goes to process start,
+tokenizer/index load and engine construction before the first shard is read.
 Re-boots are faster once the JIT caches under `~/.cache/dsv41-ds41f/kkref/jit`
 are warm; the first boot after an image build pays the TileLang/B12X compile
 once.
@@ -89,7 +132,8 @@ once.
 | Metric | Value |
 |---|---|
 | Engine reservation (`cuda_alloc` at ready) | 110.5 GiB |
-| Steady-state MemAvailable | ~4.0 GiB at `--max-model-len 32768`, 3.7-3.8 GiB at 229376, 3.1-3.2 GiB at 524288 |
+| Steady-state MemAvailable | ~4.0 GiB at `--max-model-len 32768`, 3.7-3.8 GiB at 229376, 2.9-3.2 GiB at 524288 |
+| Idle MemAvailable before boot (after drop_caches) | 116.7-119.3 GiB; every one of these reached 2.9-3.2 GiB at ready, so the idle reading does not predict the steady one |
 | MemAvailable minimum under a 520K-token prefill | 2.23 GiB (0.93 GiB transient; floor 0.5 GiB) |
 | Swap | 0 KiB growth, 0 kills |
 | Cold-expert alias side file | 9,228,943,360 B (8.59 GiB) on disk, mapped read-only |
@@ -100,8 +144,31 @@ All-experts-resident does not fit under vLLM on this part: un-aliasing layers
 boot. That is the whole reason for the side file. Guard policy: 0.5 GiB
 MemAvailable floor, 64 MiB swap-growth allowance, 0.05 s sampling
 (`scripts/guard.sh`). Do not serve without it armed.
+The guard runs as root and keeps its files (`stage`, `guard.log`, `sysctl.before`) in the
+run directory, which the container cannot see: it gets only `$RUN/ctr` at `/mem`.
+`guard.sh stop` restores only the three sysctls `serve.sh` changes, and only integer values.
 
 ## Measured speed
+
+**Cold-expert set.** Every speed figure on this page through the W2 row was measured with
+the first cold set (1,380 experts over 24 layers). The shipped set (1,418 experts over 43
+layers, re-selected from a route histogram that includes long and agentic prompts; same
+side-file size and resident footprint) was measured on another GB10 box at `MAXLEN=32768`:
+bench7 131.3 / 132.0 ms/step against 139.8 for the first set, an 18-request agentic replay
+407.6 / 400.4 s against 763.4 s, NVMe read during one bench7 9.7-10.8 GiB against
+13.5-18.2 (details in `docs/ENGINEERING_NOTES.md`).
+
+On the measurement box at the shipped default `MAXLEN=524288` the shipped set is faster than
+the first one: two boots each, alternating old/new with only `ALIAS_DIR` switched, bench7 mean
+**130.5 ms/step** (129.7 / 131.3; per class prose 126.0, code 134.5, structured 131.0)
+against **137.1** (138.4 / 135.7; 134.6 / 140.6 / 136.0), -4.8 %. NVMe read during one
+bench7 fell from 10.27 / 10.60 GiB to 7.04 / 7.28 GiB. Ready time and resident footprint are
+unchanged (193-198 s, 3.07-3.21 GiB MemAvailable at ready, 2.92-3.20 GiB page cache).
+
+| Cold set | ms/step, two boots | tok/step | tok/s | NVMe read, one bench7 |
+|---|---:|---:|---:|---:|
+| first (1,380 experts / 24 layers) | 138.4, 135.7 | 4.73 | 34.1, 34.9 | 10.27, 10.60 GiB |
+| **shipped (1,418 / 43)** | **129.7, 131.3** | 4.69 | 35.6, 36.3 | 7.04, 7.28 GiB |
 
 One row per configuration. `bench7.py`, single stream, 512 generated tokens with
 `ignore_eos`, three unique prompts per class (prose / code / structured).
@@ -116,7 +183,8 @@ run to run, so compare `ms/step` first.
 | + cold-expert ATS alias | 202.8 | 5.02 | 24.2 |
 | + second kernel variant (k4) | 188.8-191.2 | 5.00 | 25.7-27.5 |
 | + tile-K 16 build, k=5 | 140.0-145.6 | 4.35-4.74 | 31.3-34.0 |
-| + TP1 decode tiles for the non-MoE linears (serving) | 141.0-141.8 | 4.14-4.58 | 29.5-32.4 |
+| + TP1 decode tiles for the non-MoE linears | 141.0-141.8 | 4.14-4.58 | 29.5-32.4 |
+| + warp-private MoE pipeline stages (W2), at 524288 (serving) | 133.0-141.0 | 4.55-4.91 | 32.5-38.2 |
 
 The decode-tile row is the mean of two boots alternated with two boots of the row above
 (141.4 vs 144.8 ms/step); its tok/s spread is acceptance, not kernel speed.
@@ -124,16 +192,23 @@ The decode-tile row is the mean of two boots alternated with two boots of the ro
 Tile-K 16 configuration per class, two ship boots: prose 137.6-138.4 ms/step,
 code 143.2-146.2, structured 142.2-144.5.
 
-All rows above were measured at `--max-model-len 32768`. At the default 524288 the
-same configuration runs 147.2 ms/step (see Measured long context).
+The rows above the W2 row were measured at `--max-model-len 32768`; at the default
+524288 that configuration runs 145.9-147.2 ms/step (see Measured long context). The W2
+row was measured at 524288: four boots of recipe-built images, mean 137.4 ms/step (per
+class prose 134.4, code 138.3, structured 139.8). Two of them alternated with two boots
+of the previous build, whose warm boot read 145.9; on the measurement launcher two
+alternating pairs read 136.35 vs 144.2 ms/step (-5.4 %). Outputs are bit-identical to
+the previous kernel (see Quality and correctness). Not counted: one first boot straight
+after an image build that read 190 ms/step (see Keep the disk quiet).
 
-Where the step time goes (nsys, attributed by CUDA graph, 139.4 ms/step): the 40
+Where the step time goes (nsys before the W2 kernel, attributed by CUDA graph, 139.4 ms/step): the 40
 main layers verifying 6 rows take 124.4 ms (89 %), the DSpark drafter 9.2 ms (three
 MTP layers over 5 rows 5.4, draft head 2.8, Markov steps 0.5), verify head and
 sampling 2.9 ms. The MoE dominates the main layers. Its kernel already keeps enough
 bytes in flight to saturate DRAM and is not short of warps (two CTAs per SM measured
-12 % slower); what limits it is a fixed dependent chain per K-slice (barriers plus
-exposed latency). Details in `docs/ENGINEERING_NOTES.md`.
+12 % slower); what limits it is a fixed dependent chain per K-slice. The W2 kernel
+took the CTA-wide barriers out of that chain; what is left is exposed latency on the
+weight reads. Details in `docs/ENGINEERING_NOTES.md`.
 
 ## Measured prefill
 
@@ -176,6 +251,7 @@ Prefix caching is off, so every row is a full prefill.
 | 229,376 | 224,983 | 0.1 | 195.5 s | 1,151 | 31.5 | yes | 3.01 GiB |
 | **524,288 (default)** | 393,176 | 0.1 | 380.6 s | 1,033 | 29.3 | yes | 2.07 GiB |
 | **524,288 (default)** | 519,984 | 0.5 | 516.4 s | 1,007 | 29.3 | yes | 2.23 GiB |
+| **524,288 (default), shipped cold set** | 518,103 | 0.5 | 470.2 s | 1,102 | 25.6 | yes | 2.19 GiB |
 
 Short prompts (bench7, 512 tokens, k=5, warm boot), by `--max-model-len`:
 
@@ -184,6 +260,9 @@ Short prompts (bench7, 512 tokens, k=5, warm boot), by `--max-model-len`:
 | 32,768 | 3.9-4.0 GiB | 140.5-142.0 | 4.35-4.67 | 31.3-34.0 |
 | 229,376 | 3.7-3.8 GiB | 145.4 (139.7 / 150.6 / 145.9) | 4.38 | 30.3 |
 | 524,288 | 3.1-3.2 GiB | 147.2 (141.4 / 153.8 / 146.4) | 4.10 | 27.1 |
+| **524,288, W2 kernel (serving)** | 3.12-3.21 GiB | **137.4 (134.4 / 138.3 / 139.8)** | 4.73 | 35.1 |
+
+The first three rows are the previous kernel; the W2 row is the mean of four boots.
 
 The step-time cost of the longer limit is 1-5 %; the tok/s spread is mostly acceptance
 (tok/step moves between runs on the same prompts). Use `MAXLEN=32768` if you never need
@@ -191,28 +270,99 @@ long prompts. Prefill does not slow with depth on this text (1.0-1.2K tok/s from
 520K); it is faster than the stdlib-source ladder above because log lines route to fewer
 experts.
 
+**Prefix caching (opt-in).** `PREFIX_CACHING=1 bash scripts/serve.sh` serves with
+`--enable-prefix-caching`; the default stays off. It pays when requests share a long prefix
+(multi-turn chat, agents re-sending history). Measured on two other boxes at `MAXLEN=32768`,
+`KVB=268435456` (off on one, on on the other; bench7 within 1 % between them), eight greedy lookups (`req=<id>` -> `latency_ms`) against one shared
+7.5K-token log prompt:
+
+| Prefix caching | Lookups correct | Request time, first | Requests 2-8 | bench7 ms/step |
+|---|---:|---:|---:|---:|
+| off | 8/8 | 10.6 s | 9.9-12.0 s | 142.4-149.4 |
+| on | 8/8 | 10.4 s | 1.6-2.6 s | 143.4 |
+
+bench7 prompts do not share prefixes, so its step time is the no-hit cost. Not measured at
+long `MAXLEN` or with prompts past 7.5K tokens.
+
+**Smaller KV pool at 32K.** At `MAXLEN=32768` one request needs far less than the 1 GiB
+pool. `KVB=268435456` (256 MiB; vLLM reports 59,022 tokens, 1.80x one 32K request) gives
+~1 GiB back to the page cache that holds the cold-expert alias. Measured on two other
+boxes that have only ~1.0-1.1 GiB MemAvailable at ready in this config, bench7 as above,
+`MAXLEN=32768` on every row; mean step time -9 % on box A, -14 % on box B:
+
+| Box | `KVB` | Ready MemAvailable | ms/step mean | tok/s |
+|---|---:|---:|---:|---:|
+| A | 1 GiB | 1.07 GiB | 156.6, 163.1 | 28.1, 27.3 |
+| A | 256 MiB | 1.93-1.98 GiB | 149.4, 142.4 | 30.5, 31.7 |
+| B | 1 GiB | 1.1 GiB | 161.4, 160.2 | 27.4, 27.8 |
+| B | 256 MiB | 2.15 GiB | 141.0, 136.5 | 32.4, 31.7 |
+
+Not measured on the box above (~4 GiB free at 32K). Do not use 256 MiB with a long
+`MAXLEN`: the pool must hold at least one full-length request.
+
 **Why not 1M.** The prefill transient grows with prompt length (about 0.3 GiB at 225K,
 0.4 GiB at 393K, 0.9 GiB at 520K). A `--max-model-len 1048576` server boots (KV 1.25 GiB,
 ready MemAvailable 1.99 GiB, no RoPE-cache trim to give memory back), but a 524K prompt
 on it drove MemAvailable to 0.44 GiB and the guard stopped it. 524,288 is the largest
 limit that passed with margin.
 
-**Keep the disk quiet while serving.** Cold experts are read from NVMe on every step.
-One boot started right after ~10 GB of build output had been written to a 97 %-full
-disk measured 509.5 ms/step and 253 tok/s prefill for its whole 25-minute life; a reboot
-of the same configuration after `sync` and `drop_caches` was normal. The cause was not
-isolated further. `scripts/serve.sh` runs `sync` and drops caches before every boot;
-do not build images or copy large files on the serving disk while it runs, and
-re-bench after a warmup request before trusting a slow first boot.
+**Keep the disk quiet while serving, and restart once after building.** Cold experts
+are read from NVMe on every step. The first boot after an image build runs slow for its
+whole life and the next boot is normal. Measured on the measurement box (98 % full NVMe,
+same image and config, warm JIT cache, 1 s disk/vmstat/clock sampling, `bench7`):
+
+| Boot | ms/step | NVMe read ms | NVMe MiB/s | compact_stall/s | pgscan_direct/s | page cache at ready |
+|---|---:|---:|---:|---:|---:|---:|
+| control, boot after a serve stop | 138.5 (126-147) | 0.63 | 58 | 3 | 0 | 2.97 GiB |
+| after 12 GiB of `O_DIRECT` writes, no build | 138.9 (132-149) | 0.77 | 56 | 4 | 81 | 3.41 |
+| after 119 GiB of pack reads, no writes | 135.3 (125-145) | 0.75 | 58 | 0 | 0 | 3.32 |
+| first boot after `docker build --no-cache` | 230.1 (170-403) | 0.25 | 174 | 252 | 3614 | 0.81 |
+| ... the same boot, re-benched at +10 / +20 min | 203.9 / 206.1 | | | | | |
+| ... after a build with `drop_caches=3` + `compact_memory` before the boot | 420.9 (179-726) | 0.24 | 261 | 1145 | 8692 | 0.40 |
+| ... and then stop + serve again | 141.3 (132-158) | 0.59 | 60 | 3 | 91 | 3.32 |
+
+The drive is not the problem: it reads *faster* in the slow boots (0.25 ms, 174-261 MiB/s)
+than in the control (0.63 ms, 58 MiB/s), and 12 GiB of direct writes does not reproduce
+it. Boot-time free memory and fragmentation are not the problem either: the cleanest
+pre-boot state of the matrix (117.3 GiB free, 67 % of it in >= 2 MiB blocks, 0.1 GiB of
+cache) was the slowest boot. What changes is how much of the cold working set is resident
+in the page cache once the engine owns its ~107 GiB. `MemAvailable` is ~3.1 GiB in every
+arm; the split of that residual is what moves. With ~3 GiB of cold-expert pages resident a
+step reads ~8 MiB from NVMe; with ~0.5 GiB resident it re-reads 40-110 MiB per step, and
+the kernel runs direct reclaim and compaction on the faulting path (3.6k-8.7k pages/s
+scanned, 250-1150 compaction stalls/s, 4-7x the major faults) even though ~3 GiB is free,
+while the GPU sits at its normal 2496-2528 MHz. Why that free memory is not taken up by
+the cache after a build is not pinned down; the reclaim apparently keeps evicting the pages
+just read, because the state does not decay.
+
+The condition is set by the load and does not decay: 230.1, then 203.9 at +10 min and
+206.1 at +20 min on the same boot. So after `build_image.sh`, `download_and_verify.sh` or
+`build_cold_alias.sh`, start the server, stop it (`scripts/guard.sh stop`) and start it
+again before you measure or rely on it; waiting on a slow boot does not help, and
+`drop_caches`/`compact_memory` before the boot do not either. `serve.sh` writes the
+ready-state split to `$RUN/ready-mem`, and `scripts/guard.sh status` prints it and warns
+when the cache is under 1.5 GiB (normal boots 2.97-3.41 GiB, slow ones 0.40-0.81). Earlier,
+less instrumented runs agree: 358.6 ms/step after a build, 214.3 with `drop_caches` +
+`compact_memory`, 190 -> 228 on one slow boot re-benched after 10 minutes, and 137-140 after
+a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s prefill for
+25 minutes. Do not build images or copy large files on the serving disk while it serves.
 
 ## Quality and correctness
 
+- **W2 MoE kernel (warp-private pipeline stages) versus the previous kernel:**
+  bit-identical outputs in all 12 probe cells (rows 1 and 7, both projections, three
+  layers), cold-bench parity rel-L2 5.8e-08, and the same 0.51 ulp against the fp32
+  reference. In model, a teacher-forced comparison against a boot of the previous build
+  (32 positions) read top-1 87.5-96.9 % and max |dlogp| 0.32-1.01; the same comparison
+  between two boots of the previous build read 93.75 % and 0.771. Greedy decode on this
+  engine is not bit-deterministic (atomic adds), so boots of one build differ too; at 32
+  positions one token is 3.1 points of top-1.
 - **Tile-K 16 numerics versus a true fp32 reference:** rel-L2 2.491e-4 (up) /
   2.188e-4 (down) against a 0.50-0.51 fp16 ulp floor, uniform in K and N. The
   build is not one ulp worse than the base kernel anywhere; the base-vs-tile-K
   delta is two independent realizations of the same 0.5-ulp C-buffer rounding.
 - **Teacher-forced logprob checks** on every shipped arm (32 positions, full
-  vocabulary): top-1 agreement 78-97 % against the non-speculative reference
+  vocabulary): top-1 agreement 78.1-93.8 % against the non-speculative reference
   depending on the arm, max |dlogprob| inside that session's own noise floor.
   The gate exists to catch a wrong kernel, not to score quality.
 - **Greedy output is not bit-deterministic** on this engine: batched atomics in
@@ -220,26 +370,107 @@ re-bench after a warmup request before trusting a slow first boot.
   tail. Do not build exact-match tests on it; compare logprobs.
 - Pack-level quality figures are on the model card. This recipe did not re-run
   them.
+- **Tool-call replies can run away without the DSML stop.** (In the DSML tags below, `|` stands for
+  U+FF5C, the fullwidth bar the model actually emits.) At `temperature=1.0` the
+  model sometimes closes an invoke and then, instead of `</|DSML| calls>`, writes
+  invented closing tags (`</arguments>`, then `</function>` thousands of times) until
+  EOS or `max_tokens`. The tool parser keeps the valid invokes and drops the rest, so
+  the reply looks normal; only `usage.completion_tokens` shows it. Replaying two agent
+  conversation states (1.9K and 63.7K-token prompts), 2 of 6 replies failed this way,
+  one at 32,313 tokens / 648 s for 6 valid calls. `DSML_STOP=1` (the default) adds the
+  stop string `</|DSML| invoke>\n</`, kept in the output, to requests that carry tools:
+  12 of 12 replays of the same states ended in 6-278 s with every closed invoke parsed,
+  streaming included. It does not catch the rarer form where the model leaves out
+  `</|DSML| parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
+  Checked on the measurement box with `DSML_STOP=1` (the default): one tool request at
+  `temperature=0` and five at `temperature=1.0` (`get_weather(city)`, `max_tokens` 2048-4096)
+  all ended right after the closed invoke — `finish_reason: tool_calls`, one parsed call with
+  `{"city": "Lisbon"}`, 49-56 `completion_tokens` — and a request without tools was unchanged
+  (`finish_reason: stop`, 21 tokens).
 
 ## Known limits
 
+- **Oversized sampling lists get a 400, not a crash.** The DSpark path samples on vLLM's
+  Model Runner V2, which raises inside the engine core, and so stops the whole server, on a
+  request with more than 1,024 `allowed_token_ids`, more than 1,024 `logit_bias` entries,
+  more than 128 stop ids together with `min_tokens`, or more bad words (count or total
+  tokens) than `VLLM_MAX_NUM_BAD_WORDS` / `VLLM_MAX_BAD_WORDS_TOTAL_TOKENS`. The shim checks
+  the same limits in the API server and answers 400 instead.
 - **50-60 tok/s is not reached.** 31-34 tok/s is the best measured so far;
-  kernel work continues on the fork branch. Getting to ~46 tok/s needs ~42 ms out of a 140 ms step; the
+  kernel work continues on the fork branch. At the measured 4.7 accepted tokens/step,
+  ~48 tok/s needs ~42 ms out of a 140 ms step (~50 tok/s needs ~45 ms); the
   ranked candidates and the arithmetic are in `docs/ENGINEERING_NOTES.md`.
 - **Vision is not enabled** (`--language-model-only`); no image path was measured.
-- **Chat endpoint on a fresh download: TODO(confirm).** The measured pack
-  directory also held a `chat_template.jinja` carried over from an earlier upload
-  of this pack; the current Hub revision does not ship one. All speed figures use
-  plain `/v1/completions`; `/v1/chat/completions` against a fresh download has not
-  been checked.
-- **Image build: TODO(confirm).** The measured server bind-mounted the same fork and
-  plugin trees (identical file hashes to the pinned commits) into the engine image;
-  the baked build in `docker/Dockerfile` has not yet been run end to end.
+- **Chat endpoint: no chat template ships in the pack, and none is needed.** The
+  Hub revision has no `chat_template.jinja` and neither `tokenizer_config.json`
+  nor `tokenizer.json` carries a `chat_template` field. `--tokenizer-mode
+  deepseek_v41` does not need one: `vllm/tokenizers/deepseek_v41.py` overrides
+  `apply_chat_template` and encodes the conversation in code. Measured on a
+  from-scratch install without either file: one user message ("What is the
+  capital of France?", `max_tokens 32`) returns HTTP 200,
+  `finish_reason=stop`, `The capital of France is **Paris**.` Checked on a served
+  request (fresh download, this recipe's flags): the thinking comes back in
+  `message.reasoning` (`usage.completion_tokens_details.reasoning_tokens` counts it),
+  and a request with `tools` returns `finish_reason: tool_calls` with parsed
+  arguments (`--tool-call-parser deepseek_v41`). Reasoning effort goes in
+  `chat_template_kwargs`: `{"reasoning_effort": "low"}` renders `Reasoning Effort: 50`;
+  a top-level `reasoning_effort` field is ignored and the prompt keeps the default 75
+  (checked with `/tokenize` + `/detokenize`). All speed figures here are plain
+  `/v1/completions`. If you point the server at a different tokenizer mode, supply a
+  template or chat will 400.
+- **Image build: built and served from scratch on the measurement box.**
+  `scripts/build_image.sh` on a fresh clone built the image in 269.6 s (+3.6 GB on
+  the base); served through `scripts/serve.sh` with a freshly built alias and the
+  Hub file set, it measured 145.5 ms/step, 4.71 tok/step, 31.9 tok/s at
+  `--max-model-len 524288` (bench7, previous pin `exllamav3@42981e6`), passed
+  `smoke.sh`, answered chat, and found a needle at 131K. The current pin
+  (`exllamav3@909ad85`, W2) was built the same way from a clean clone of this repo and
+  served 135.4 ms/step, 4.91 tok/step, 36.2 tok/s at 524288. Its MoE sources match the
+  measured W2 build file for file except the aarch64 patcher edits (applied at build
+  time), comments and a removed debug print. For the previous pin, every input of the
+  baked image was also compared against what the measured server mounted:
+  `plugin-moe-p9b` is byte-identical to `vllm-exl3@30e8b94` (21/21 `.py`),
+  `build-tk16` is byte-identical to `exllamav3@42981e6` after the aarch64 patcher
+  (14/14 files, including the K=16 header), the shim is identical, and
+  `docker/tp1_decode_tiles.py` applied to the base image's `gemm.py`/`wo.py`
+  reproduces `overlay-p12` exactly (comment-only diff). The compiled plugin
+  extension is unchanged between the measured image's `2a740a3` and `30e8b94`
+  (`git diff --stat 2a740a3 30e8b94 -- csrc setup.py` is empty). Not covered: the
+  base image built on another machine (base-image drift).
+- **First boot on a fresh box compiles the TileLang kernels, and the guard can stop
+  it.** A from-scratch install on a tester's Spark was stopped by the guard at 432 MiB
+  MemAvailable during this compile. Replayed from scratch on the measurement box
+  (fresh clone, image, alias and an empty cache), the first boot compiled 156 kernels
+  (1,817 files, 72 MB in `$CACHE_DIR/kkref/jit`). The compile fan-out is the cause: up to 25 concurrent
+  nvcc/cicc/cc1plus/ptxas processes at 20-390 MB each, ~2.5 GB on top of the
+  engine, at a point where the model reservation is already 107.4 GiB.
+  Measured on one box, same image and pack: cold cache with the stock worker
+  counts **min 1.43 GiB**; cold cache with `B12X_*_COMPILE_WORKERS=1` and
+  `TVM_NUM_THREADS=1` / `TVM_BIND_THREADS=1` **min 2.67 GiB**, ready 302 s vs 305 s.
+  `scripts/serve.sh` applies those overrides automatically while the JIT cache is
+  cold, i.e. until a boot has reached ready once and left `$CACHE_DIR/kkref/jit/.warm`
+  (a boot killed half-way leaves no marker, so the next one is serialised again).
+  That first boot serves normally, but the speed figures were measured with the
+  stock worker settings: run `scripts/serve.sh` once more after it is ready. The
+  kernels persist in `$CACHE_DIR/kkref/jit` (mounted at `/cache`) and later boots
+  compile nothing. Every number in this README was measured with a warm cache.
+- **Steady MemAvailable can be lower than measured here.** The same from-scratch
+  install read 1.6 GiB after the smoke test, against 3.1-3.2 GiB measured at
+  `--max-model-len 524288` on the measurement box (4.0 at 32768). The from-scratch
+  replay on the measurement box (fresh image, alias and cache, Hub file set) read
+  2.87-3.05 GiB at ready and ~3.0 GiB after smoke and bench, with the engine's
+  reservation identical to the measured runs (`cuda_alloc` 107.43 GiB, within
+  0.02 GiB at `POST_LOAD`). The recipe's own footprint is the same on both runs, so
+  the tester's 1.6 GiB points at what else that box holds. The idle reading before
+  boot does not predict it: boots that started at 116.7, 117.2, 119.2 and 119.3 GiB
+  idle all reached 2.9-3.2 GiB at ready. Check `docker stats` and the host's resident
+  processes while serving. The 0.5 GiB guard floor still holds; if your box reads well
+  under 3 GiB at ready, `MAXLEN=32768` buys back about 0.9 GiB.
 - **`--max-num-batched-tokens 8192` does not fit.** 2112 is the measured value.
 - **Context: 524,288 tokens, not the rated 1M.** Retrieval passed from 32K to 520K (see
   Measured long context); 1M does not fit this box's memory with the guard armed. The
-  speed tables above were measured at `--max-model-len 32768`; at 524288 short prompts
-  are 1-5 % slower.
+  older speed rows were measured at `--max-model-len 32768`, where short prompts are
+  1-5 % faster than at 524288; the W2 row was measured at 524288.
 
 ## Do not
 
@@ -247,8 +478,8 @@ re-bench after a warmup request before trusting a slow first boot.
 - Do not drop the cold-expert alias (`VLLM_EXL3_ATS_ALIAS=0`) and expect a boot:
   the pack does not fit resident.
 - Do not raise `--max-num-batched-tokens` to 8192 without re-measuring; it OOMs.
-- Do not build the fork without `MOE_TILESIZE_K=16`; you get the 25 %-slower
-  kernel and none of these numbers apply.
+- Do not build the fork without `MOE_TILESIZE_K=16`; you get the 32-row tile,
+  ~34 % slower per step (190.6 vs 142.0 ms), and none of these numbers apply.
 - Do not enable prefix caching (measured off) or `B12X_AUTOTUNE` (hours of
   bring-up) as a "helpful" default.
 - Do not run the container without `seccomp=unconfined`; io_uring init fails.
@@ -261,21 +492,33 @@ re-bench after a warmup request before trusting a slow first boot.
 | NVIDIA DGX Spark (GB10) | 128 GB unified | Measured (this recipe) |
 
 Nothing else has been verified. The recipe needs ~110.5 GiB of device
-reservation plus ~4 GiB of headroom, and depends on unified memory: the alias
+reservation plus 3.1-4.0 GiB of headroom depending on `--max-model-len`, and
+depends on unified memory: the alias
 side file only works because device and host memory are the same pool.
 
 ## Pack revision
 
-Measured against revision `7cdebca3f8a348e423ad293a2ea5cca2297ace1f`. The Hub's
-`main` is now `04f7138b8ce3c82399eb4900d8bad12e40a0a0da`, which is what
-`scripts/env.sh` pins. `7cdebca3` no longer resolves through the Hub API: the
-repo's history is a single `Initial commit` at `04f7138b`, so the earlier
-revision was replaced rather than advanced. The check therefore compares content:
-`04f7138b` returns the same 21 files with byte-identical sizes to the measured
-copy (17 shards, index, `config.json`, `tokenizer.json`, `tokenizer_config.json`),
-so it carries no weight or config change relative to the measurement.
-`scripts/SHA256SUMS` is the Hub's own LFS sha256 for the 18 LFS files plus
-sha256 of the three small ones.
+The numbers were measured on a pack downloaded at revision `7cdebca3`. The Hub
+repo's history has since been replaced twice, each time with a single
+`Initial commit` holding the same files (`04f7138b`, then `2a6059359c68`), so old
+commit ids stop resolving. `scripts/env.sh` pins the current one,
+`2a6059359c685cd0ea66e1e6c34e6803322ff095`; the Hub revision has 24 files and the
+21 this recipe needs all match `scripts/SHA256SUMS` (sha256 of the 17 shards, the
+index, `config.json`, `tokenizer.json` and `tokenizer_config.json`). The other
+three (`.gitattributes`, `LICENSE`, `README.md`) are not used at serve time.
+
+**`scripts/SHA256SUMS` is the authority, not the commit id.** If the pinned
+revision is gone, `download_and_verify.sh` downloads `main` with a warning and
+the sha256 check decides whether it is the measured pack. A mismatch means the
+weights changed; do not serve it as this recipe.
+
+The Hub revision does not ship `engram_token_map.u32` (517,120 B) or
+`chat_template.jinja` (4,015 B), both of which exist in the measurement box's
+copy of the pack. Neither is in `SHA256SUMS` and neither is required: a
+from-scratch install without them boots, passes `smoke.sh`, answers
+`/v1/chat/completions` and retrieves a needle at 131K, with the same
+`cuda_alloc` (107.43 GiB) and `AnonPages` (2.96 GiB) as the measurement box at
+`POST_LOAD`.
 
 ## Credits and license
 
@@ -284,8 +527,8 @@ sha256 of the three small ones.
   TileKernels, sparknet. The base image is built per
   [justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark](https://github.com/justincasey/DeepSeek-V4.1-Flash-1017-4x-DGX-Spark)
   `docker/Dockerfile`.
-- Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels,
-  aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
+- Runtime forks pinned here: `vcruz305/exllamav3` (mixed-K unified MoE kernels
+  with warp-private pipeline stages, aarch64 guards) and `vcruz305/vllm-exl3` (EXL3 quant method, ATS loader).
 - Model: DeepSeek-V4.1-Flash-1017 (MIT), quantized by
   [vcruz305](https://huggingface.co/vcruz305).
 - Recipe scripts: MIT.
@@ -302,7 +545,7 @@ sha256 of the three small ones.
 | `docker/tp1_decode_tiles.py` | TP1 decode tile tables for the base image's FP8 TileLang linears |
 | `scripts/build_cold_alias.sh` | builds the cold-expert side file from your own pack copy |
 | `tools/ats_build_alias.py` | the gatherer (64-byte alignment, manifest, selection) |
-| `configs/cold-alias-selection.json` | the measured 1,380-expert membership |
+| `configs/cold-alias-selection.json` | the measured 1,418-expert membership |
 | `scripts/serve.sh` | host wrapper: docker run, sysctls, memory guard |
 | `scripts/serve_inner.sh` | the exact measured in-container vLLM invocation |
 | `scripts/guard.sh` | memory guard, status, stop (restores sysctls) |

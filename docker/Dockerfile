@@ -19,10 +19,14 @@
 ARG BASE_IMAGE=dsv41-1017-ds41f:r6w
 FROM ${BASE_IMAGE}
 
+# Re-declared inside the stage: an ARG before FROM is not visible to RUN/LABEL,
+# and buildkit warns "UndefinedVar: $BASE_IMAGE" without it.
+ARG BASE_IMAGE
+
 ARG PLUGIN_REPO=https://github.com/vcruz305/vllm-exl3.git
 ARG PLUGIN_REF=30e8b941376ce2d43bc8438439937c4809106635
 ARG FORK_REPO=https://github.com/vcruz305/exllamav3.git
-ARG FORK_REF=42981e660d18bd893fb1bf732905fafa2a9fe97c
+ARG FORK_REF=909ad8564fcb9e070caca8a65d380c741681e79c
 ARG MOE_TILESIZE_K=16
 
 ENV CUDA_HOME=/usr/local/cuda \
@@ -40,8 +44,9 @@ RUN set -eux; \
     git -C /opt/vllm-exl3 checkout "$PLUGIN_REF"; \
     git -C /opt/vllm-exl3 rev-parse HEAD
 
-# The served MoE kernel instance is compiled at tile-K 16, a #define in the fork,
-# so the build rewrites it before compiling rather than passing a flag.
+# The served MoE kernel instance is compiled at tile-K 16, a #define in the fork.
+# At the pinned FORK_REF the header already reads 16; the build still rewrites it to
+# MOE_TILESIZE_K and asserts the result, so the build argument is never silently ignored.
 RUN set -eux; \
     git clone "$FORK_REPO" /opt/exllamav3; \
     git -C /opt/exllamav3 checkout "$FORK_REF"; \
@@ -49,11 +54,13 @@ RUN set -eux; \
     PATCHER=/opt/vllm-exl3/tools/patch_exllamav3_aarch64.py; \
     if [ -f "$PATCHER" ]; then \
         sed -i 's|raise SystemExit(f"expected one x86 pause block in {path}")|print(f"already guarded (x86 pause): {path}")|' "$PATCHER"; \
+        grep -q 'already guarded (x86 pause)' "$PATCHER"; \
         python3 "$PATCHER" /opt/exllamav3/exllamav3/exllamav3_ext; \
     fi; \
     F=/opt/exllamav3/exllamav3/exllamav3_ext/quant/exl3_moe_common.cuh; \
-    sed -i "s/#define MOE_TILESIZE_K 32/#define MOE_TILESIZE_K ${MOE_TILESIZE_K}/" "$F"; \
+    sed -i -E "s/#define MOE_TILESIZE_K [0-9]+/#define MOE_TILESIZE_K ${MOE_TILESIZE_K}/" "$F"; \
     grep -n "define MOE_TILESIZE_K" "$F"; \
+    grep -qx "#define MOE_TILESIZE_K ${MOE_TILESIZE_K}" "$F"; \
     CUSPARSE_DIR="$(find /usr/local/lib/python3*/dist-packages/nvidia -name cusparse.h -exec dirname {} \; 2>/dev/null | head -1)"; \
     if [ -z "$CUSPARSE_DIR" ]; then echo "ERROR: cusparse.h not found under NVIDIA Python packages" >&2; exit 2; fi; \
     export CPATH="$CUSPARSE_DIR${CPATH:+:$CPATH}"; \

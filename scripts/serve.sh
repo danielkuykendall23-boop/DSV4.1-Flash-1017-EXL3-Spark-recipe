@@ -220,16 +220,30 @@ echo "run dir: $RUN"
 echo "preflight" >"$RUN/stage"
 # Detached (setsid nohup) so it outlives this shell and an ssh logout; it ends
 # when the container's log stream ends.
+# The awk program goes in as an argument: a single-quoted program inside the
+# single-quoted bash -c body would end the outer quote and kill the watcher.
+READY_MEM_AWK='/^Cached:/{c=$2} /^MemFree:/{f=$2} END{printf "page cache %.2f GiB, free %.2f GiB\n", c/1048576, f/1048576}'
 setsid nohup bash -c '
   sudo -n docker logs -f "$1" 2>&1 | while IFS= read -r line; do
     case "$line" in
       *"Starting to load model"*)       echo "load-weights" >"$2/stage" ;;
       *"Graph capturing"*)              echo "graph-capture" >"$2/stage" ;;
       *"init engine"*)                  echo "engine-init" >"$2/stage" ;;
-      *"Application startup complete"*) echo "ready" >"$2/stage"; : >"$3/.warm" ;;
+      *"Application startup complete"*) echo "ready" >"$2/stage"; : >"$3/.warm"
+        awk "$4" /proc/meminfo >"$2/ready-mem" ;;
     esac
-  done' _ "$CONTAINER" "$RUN" "$JIT_HOST" >/dev/null 2>&1 &
+  done' _ "$CONTAINER" "$RUN" "$JIT_HOST" "$READY_MEM_AWK" >/dev/null 2>&1 &
 echo "stage watcher: pid $!"
+
+# ---- ready-state page-cache split ------------------------------------------
+# A boot that comes up with ~3 GiB of page cache and little free memory decodes
+# at 138-141 ms/step. A boot that comes up with ~0.5 GiB of cache and ~3 GiB
+# free re-reads 40-110 MiB/step from NVMe instead of ~8, runs 3.6k-8.7k pages/s
+# of direct reclaim and 250-1150 compaction stalls/s on the step thread, and is
+# 1.5-3x slower for its whole life. That state is produced by an image build
+# just before the boot and is not fixed by drop_caches, compact_memory or
+# waiting: stop the serve and start it again. The split is written to
+# $RUN/ready-mem when the server reports ready (see "Keep the disk quiet").
 
 # ---- memory guard ---------------------------------------------------------
 sudo -n setsid nohup bash "$HERE/guard.sh" watch "$CONTAINER" "$RUN/stage" "$RUN/guard.log" 524288 "$BASE_SWAP" \

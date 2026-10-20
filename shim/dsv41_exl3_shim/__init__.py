@@ -34,6 +34,12 @@ one-line-per-stage memory waterfall (host MemAvailable / AnonPages / Cached /
 VmRSS, torch cuda allocated+reserved) plus, after the load returns, the
 parameter+buffer bytes grouped by module path with the layer index collapsed to
 ``*`` and the largest single tensors.  It only reads state; it never allocates.
+
+DSML tool-call stop (``DSV41_DSML_STOP=1``)
+-------------------------------------------
+Adds the stop string ``</｜DSML｜ invoke>\n</`` (kept in the output) to chat
+requests that carry tools, so a reply ends at the first closing tag after a
+closed invoke.  See ``_install_dsml_stop``.
 """
 
 from __future__ import annotations
@@ -445,6 +451,46 @@ def _install_exl3_head() -> None:
         cls.__init__ = _wrap(cls.__init__, head_prefix)
 
 
+def _install_dsml_stop() -> None:
+    """End a tool-call reply once a DSML invoke has closed and anything but DSML follows.
+
+    After ``</｜DSML｜ invoke>`` the only valid continuations are another
+    ``<｜DSML｜ invoke`` or ``</｜DSML｜ calls>``.  At temperature 1.0 the model
+    sometimes skips the calls terminator and writes an unbounded run of
+    invented closing tags (``</arguments>``, ``</function>`` ...) until EOS or
+    ``max_tokens``.  The tool parser keeps the valid invokes and drops the rest,
+    so the reply looks normal but can cost tens of thousands of decode steps.
+
+    The stop string ``</｜DSML｜ invoke>\n</`` fires on both the valid
+    terminator and the junk, and is kept in the output, so every closed invoke
+    still parses.  Only requests that carry tools are touched.
+    """
+    if os.environ.get("DSV41_DSML_STOP", "0") in ("0", "", "false"):
+        return
+    try:
+        from vllm.parser.deepseek_v41 import DeepSeekV41Parser
+    except Exception as exc:  # pragma: no cover
+        print(f"DSML stop install failed: {exc!r}", flush=True)
+        return
+    if getattr(DeepSeekV41Parser.adjust_request, "_dsv41_dsml_stop", False):
+        return
+    orig = DeepSeekV41Parser.adjust_request
+    stop_str = "</\uff5cDSML\uff5c invoke>\n</"
+
+    def adjust_request(self, request):
+        request = orig(self, request)
+        if getattr(request, "tools", None) and getattr(request, "tool_choice", None) != "none":
+            stop = request.stop
+            stop = [] if stop is None else ([stop] if isinstance(stop, str) else list(stop))
+            if stop_str not in stop:
+                request.stop = stop + [stop_str]
+                request.include_stop_str_in_output = True
+        return request
+
+    adjust_request._dsv41_dsml_stop = True
+    DeepSeekV41Parser.adjust_request = adjust_request
+
+
 def register() -> None:
     """Install the DSV4.1 EXL3 config. Idempotent."""
     import vllm_exl3
@@ -461,6 +507,7 @@ def register() -> None:
     _install_rope_trim()
     _install_exl3_head()
     _install_mem_probe()
+    _install_dsml_stop()
 
     if getattr(register, "_installed", False):
         return

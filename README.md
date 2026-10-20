@@ -322,6 +322,17 @@ a restart. An older case on a 97 %-full disk ran 509.5 ms/step and 253 tok/s pre
   tail. Do not build exact-match tests on it; compare logprobs.
 - Pack-level quality figures are on the model card. This recipe did not re-run
   them.
+- **Tool-call replies can run away without the DSML stop.** At `temperature=1.0` the
+  model sometimes closes an invoke and then, instead of `</｜DSML｜ calls>`, writes
+  invented closing tags (`</arguments>`, then `</function>` thousands of times) until
+  EOS or `max_tokens`. The tool parser keeps the valid invokes and drops the rest, so
+  the reply looks normal; only `usage.completion_tokens` shows it. Replaying two agent
+  conversation states (1.9K and 63.7K-token prompts), 2 of 6 replies failed this way,
+  one at 32,313 tokens / 648 s for 6 valid calls. `DSML_STOP=1` (the default) adds the
+  stop string `</｜DSML｜ invoke>\n</`, kept in the output, to requests that carry tools:
+  12 of 12 replays of the same states ended in 6-278 s with every closed invoke parsed,
+  streaming included. It does not catch the rarer form where the model leaves out
+  `</｜DSML｜ parameter>` and the junk lands inside an argument. `DSML_STOP=0` turns it off.
 
 ## Known limits
 
